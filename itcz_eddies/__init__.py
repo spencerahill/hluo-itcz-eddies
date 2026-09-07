@@ -6,6 +6,30 @@ duplication removed and with the pieces ``puffins`` already provides taken
 from there.  See ``README.md``.
 """
 
-from . import columns, decomp, derivatives, era5, mse, names, paths
+from . import (
+    columns,
+    decomp,
+    derivatives,
+    era5,
+    metrics,
+    mse,
+    names,
+    paths,
+    plotting,
+    spectra,
+    stats,
+)
 
-__all__ = ["columns", "decomp", "derivatives", "era5", "mse", "names", "paths"]
+__all__ = [
+    "columns",
+    "decomp",
+    "derivatives",
+    "era5",
+    "metrics",
+    "mse",
+    "names",
+    "paths",
+    "plotting",
+    "spectra",
+    "stats",
+]
