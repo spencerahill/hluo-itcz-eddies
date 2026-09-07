@@ -1,0 +1,286 @@
+"""The flux decomposition: what closes, what does not, and why.
+
+The tests are ordered as the argument runs.  The split is exact pointwise; it
+survives any reduction that weights longitudes equally; and it fails under a
+reduction that weights them unequally, by an amount this file measures.  That
+is F11 in ``code-review/FINDINGS.md``, reproduced on synthetic data in a few
+seconds rather than on Casper.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import xarray as xr
+
+from itcz_eddies.columns import col_int, col_int_trapz, dp_from_sfc_pressure, sfc_pressure_mask
+from itcz_eddies.decomp import (
+    block_time_mean,
+    boxcar_time_mean,
+    decompose,
+    lanczos_time_mean,
+    legacy_decompose,
+)
+
+FIVE_TERMS = ["mmc", "stationary", "transient",
+              "cross_mean_wind_eddy_mse", "cross_eddy_wind_mean_mse"]
+SIX_TERMS = FIVE_TERMS + ["zonal_cross"]
+
+
+@pytest.fixture
+def wind_and_mse(grid):
+    """A meridional wind and an MSE field with mean, stationary and transient parts."""
+    lev = xr.DataArray(grid["level"], dims="level", coords={"level": grid["level"]})
+    lat = xr.DataArray(grid["latitude"], dims="latitude",
+                       coords={"latitude": grid["latitude"]})
+    lon = xr.DataArray(grid["longitude"], dims="longitude",
+                       coords={"longitude": grid["longitude"]})
+    time = xr.DataArray(np.arange(240.0), dims="time",
+                        coords={"time": np.arange(240.0)})
+    shape = np.sin(np.pi * lev / 1000.0)
+
+    v = (2.5 * shape * np.cos(np.deg2rad(3 * lat))
+         + 1.2 * shape * np.cos(np.deg2rad(2 * lon))
+         + 1.5 * shape * np.sin(np.deg2rad(6 * lon) - 2 * np.pi * time / 12.0))
+    mse = (3.2e5 + 2.0e4 * shape
+           + 3.0e3 * np.sin(np.deg2rad(lat))
+           + 1.5e3 * np.sin(np.deg2rad(2 * lon))
+           + 2.0e3 * np.cos(np.deg2rad(6 * lon) - 2 * np.pi * time / 12.0))
+    order = ("time", "level", "latitude", "longitude")
+    return v.transpose(*order), mse.transpose(*order)
+
+
+def _relative_gap(terms, names):
+    total = terms["total"]
+    summed = sum(terms[name] for name in names)
+    return float(abs(summed - total).max()) / float(abs(total).max())
+
+
+# ------------------------------------------------------- the split is exact
+
+
+@pytest.mark.parametrize(
+    "time_mean", [boxcar_time_mean, block_time_mean, lanczos_time_mean]
+)
+def test_the_six_pointwise_terms_sum_to_the_flux(wind_and_mse, time_mean):
+    """At every gridpoint, for any time-mean operator."""
+    v, mse = wind_and_mse
+    terms = decompose(v, mse, time_mean=time_mean, zonal_mean=False).dropna("time")
+    assert _relative_gap(terms, SIX_TERMS) < 1e-12
+
+
+@pytest.mark.parametrize(
+    "time_mean", [boxcar_time_mean, block_time_mean, lanczos_time_mean]
+)
+def test_the_five_zonal_mean_terms_sum_to_the_zonal_mean_flux(wind_and_mse, time_mean):
+    """After the zonal mean, the sixth term vanishes and five suffice."""
+    v, mse = wind_and_mse
+    terms = decompose(v, mse, time_mean=time_mean).dropna("time")
+    assert _relative_gap(terms, FIVE_TERMS) < 1e-12
+
+
+def test_the_cross_terms_vanish_in_the_time_mean_for_a_block_average(wind_and_mse):
+    """A block average makes the two cross terms zero once time-averaged.
+
+    Within one block the time mean is constant, so the block average of
+    ``v_bar * h_prime`` is ``v_bar`` times the block average of ``h_prime``,
+    which is zero by construction.  The three-way split therefore closes in
+    the time mean, which is the quantity every figure in the manuscript plots.
+
+    At an individual time the cross terms are not small: on this field the
+    larger of the two reaches 9.5e-2 of the peak flux.  That is why the
+    published three-term split does not close timestep by timestep.
+    """
+    v, mse = wind_and_mse
+    terms = decompose(v, mse, time_mean=block_time_mean)
+    scale = float(abs(terms["total"]).max())
+
+    instantaneous = max(float(abs(terms[name]).max()) for name in
+                        ["cross_mean_wind_eddy_mse", "cross_eddy_wind_mean_mse"])
+    assert instantaneous / scale > 1e-3
+
+    for name in ["cross_mean_wind_eddy_mse", "cross_eddy_wind_mean_mse"]:
+        assert float(abs(block_time_mean(terms[name])).max()) < 1e-12 * scale
+
+    three = terms["mmc"] + terms["stationary"] + terms["transient"]
+    assert float(abs(block_time_mean(three - terms["total"])).max()) < 1e-12 * scale
+
+
+def test_a_planted_decomposition_is_recovered():
+    """Build the three parts separately, then check they come back.
+
+    A full longitude circle, so the zonal mean of each planted wave is zero;
+    a block time mean; and a transient part that alternates sign every step,
+    so its average over any even-length block is exactly zero.  Each planted
+    piece then lands in exactly one term of the split.
+    """
+    levels = np.array([50.0, 100, 200, 300, 400, 500, 600, 700, 800, 900,
+                       950, 1000])
+    lev = xr.DataArray(levels, dims="level", coords={"level": levels})
+    lats = np.linspace(-8.0, 8.0, 9)
+    lat = xr.DataArray(lats, dims="latitude", coords={"latitude": lats})
+    lons = np.arange(0.0, 360.0, 15.0)
+    lon = xr.DataArray(lons, dims="longitude", coords={"longitude": lons})
+    n_times = 120
+    window = int(30 * 24 / 12)          # 60 steps in a 30-day block
+    times = np.arange(float(n_times))
+    time = xr.DataArray(times, dims="time", coords={"time": times})
+
+    flip = xr.DataArray((-1.0) ** np.arange(n_times), dims="time",
+                        coords={"time": times})
+    shape = np.sin(np.pi * lev / 1000.0)
+
+    v_mean = 2.0 * shape * np.cos(np.deg2rad(3 * lat))
+    v_stat = 1.0 * shape * np.cos(np.deg2rad(2 * lon))
+    v_trans = 0.7 * shape * flip * np.sin(np.deg2rad(4 * lon))
+    h_mean = 3.0e5 + 1.0e4 * shape
+    h_stat = 2.0e3 * np.sin(np.deg2rad(2 * lon))
+    h_trans = 1.0e3 * flip * np.cos(np.deg2rad(4 * lon))
+
+    order = ("time", "level", "latitude", "longitude")
+    template = time * lev * lat * lon
+    v = (v_mean + v_stat + v_trans).broadcast_like(template).transpose(*order)
+    mse = (h_mean + h_stat + h_trans).broadcast_like(template).transpose(*order)
+
+    terms = decompose(v, mse, time_mean=block_time_mean, window_days=30)
+    assert window == 60
+
+    expected_mmc = (v_mean * h_mean).broadcast_like(terms["mmc"])
+    expected_stat = (v_stat * h_stat).mean("longitude").broadcast_like(
+        terms["stationary"])
+    expected_trans = (v_trans * h_trans).mean("longitude").broadcast_like(
+        terms["transient"])
+
+    scale = float(abs(terms["total"]).max())
+    assert float(abs(terms["mmc"] - expected_mmc).max()) < 1e-12 * scale
+    assert float(abs(terms["stationary"] - expected_stat).max()) < 1e-12 * scale
+    assert float(abs(terms["transient"] - expected_trans).max()) < 1e-12 * scale
+
+
+# ------------------------------------------------- the split under reduction
+
+
+def test_the_split_survives_a_reduction_that_weights_longitudes_equally(
+    grid, wind_and_mse
+):
+    """No terrain: the layer thicknesses are the same at every longitude.
+
+    The column integral is then a linear operator with longitude-independent
+    weights, so it commutes with the zonal mean and the five terms still add
+    up to the total after it.
+    """
+    v, mse = wind_and_mse
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    p_sfc_flat = xr.DataArray(1005.0)
+    dp = dp_from_sfc_pressure(level, p_sfc_flat)
+
+    terms = decompose(v, mse).dropna("time")
+    integrated = {name: col_int(terms[name], dp) for name in FIVE_TERMS + ["total"]}
+    summed = sum(integrated[name] for name in FIVE_TERMS)
+    gap = float(abs(summed - integrated["total"]).max())
+    assert gap / float(abs(integrated["total"]).max()) < 1e-12
+
+
+def test_the_split_fails_under_a_longitude_dependent_column_integral(
+    grid, wind_and_mse, p_sfc
+):
+    """With terrain, the five zonal-mean terms no longer add up, by a measured gap.
+
+    The reduction here is the production one: integrate each longitude down to
+    its own surface pressure, then average around the latitude circle.  Its
+    weights vary with longitude, so it does not annihilate the sixth term of
+    the pointwise split, and it does not commute with the zonal means inside
+    the stationary and transient terms either.
+
+    The gap is asserted to be present rather than to have a particular size:
+    its size depends on how deeply the terrain cuts the levels, which on the
+    real archive is what F11 measures as up to 38% of the peak flux.
+    """
+    v, mse = wind_and_mse
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    p_sfc_time_mean = p_sfc.isel(time=0, drop=True)
+    dp = dp_from_sfc_pressure(level, p_sfc_time_mean)
+
+    pointwise = decompose(v, mse, zonal_mean=False).dropna("time")
+    reduced = {name: col_int(pointwise[name], dp).mean("longitude")
+               for name in SIX_TERMS + ["total"]}
+
+    peak = float(abs(reduced["total"]).max())
+
+    # Six pointwise terms still add up: the reduction is linear.
+    six = sum(reduced[name] for name in SIX_TERMS)
+    assert float(abs(six - reduced["total"]).max()) / peak < 1e-12
+
+    # Five of them do not, and the shortfall is the sixth term.
+    five = sum(reduced[name] for name in FIVE_TERMS)
+    shortfall = float(abs(five - reduced["total"]).max())
+    assert shortfall / peak > 1e-4
+    assert float(abs((five + reduced["zonal_cross"]) - reduced["total"]).max()) / peak < 1e-12
+
+
+# -------------------------------------------------------- the legacy split
+
+
+def test_legacy_decompose_matches_the_published_script(
+    myfun, decomp_script, grid, wind_and_mse, p_sfc
+):
+    """Bitwise agreement with lines 318 to 339 of the decomposition script.
+
+    The reference below is transcribed from those lines, and it calls the
+    script's own ``running_mean``, ``maskout`` and ``nantrapz`` rather than
+    reimplementing them.
+    """
+    v, mse = wind_and_mse
+    p_sfc_long = p_sfc.reindex(time=v.time, method="nearest")
+    mask = sfc_pressure_mask(mse, p_sfc_long, below_ground=np.nan)
+    temporal_resolution = 12
+
+    # --- reference, transcribed from the script ---
+    v_adj = xr.where(mask == 1, v, np.nan)
+    mse_ref = xr.where(mask == 1, mse, np.nan)
+    v_time_mean = decomp_script.running_mean(v_adj, temporal_resolution)
+    v_mean = v_time_mean.mean("longitude", skipna=True)
+    v_mean = xr.where(mask == 1, v_mean, np.nan)
+    v_mean = v_mean - myfun.nantrapz(v_mean, v_mean.level, dim="level") / p_sfc_long
+    mse_time_mean = decomp_script.running_mean(mse_ref, temporal_resolution)
+    mse_mean = mse_time_mean.mean("longitude", skipna=True)
+    v_time_ano = v_adj - v_time_mean
+    v_ano = v_time_ano - v_time_ano.mean("longitude", skipna=True)
+    mse_time_ano = mse_ref - mse_time_mean
+    mse_ano = mse_time_ano - mse_time_ano.mean("longitude", skipna=True)
+    reference = {
+        "mmc": (v_mean * mse_mean).broadcast_like(mse_ref),
+        "stationary": ((v_time_mean - v_mean) * (mse_time_mean - mse_mean)
+                       ).mean("longitude", skipna=True).broadcast_like(mse_ref),
+        "transient": v_ano * mse_ano,
+    }
+    # --- end reference ---
+
+    mine = legacy_decompose(v, mse, mask, p_sfc_long,
+                            temporal_resolution=temporal_resolution)
+    for name, expected in reference.items():
+        got = mine[name].transpose(*expected.dims)
+        assert np.array_equal(got.values, expected.values, equal_nan=True), name
+
+
+def test_the_published_split_does_not_close(grid, wind_and_mse, p_sfc):
+    """The three published terms, reduced as published, leave a gap.
+
+    A regression guard on the legacy path rather than an aspiration: it fixes
+    the current behavior so that a change to it is visible.
+    """
+    v, mse = wind_and_mse
+    p_sfc_long = p_sfc.reindex(time=v.time, method="nearest")
+    mask = sfc_pressure_mask(mse, p_sfc_long, below_ground=np.nan)
+    terms = legacy_decompose(v, mse, mask, p_sfc_long)
+
+    total = col_int_trapz(xr.where(mask == 1, v, np.nan)
+                          * xr.where(mask == 1, mse, np.nan))
+    summed = sum(col_int_trapz(terms[name], mask) for name in
+                 ["mmc", "stationary", "transient"])
+    gap = float(abs(summed.mean("longitude", skipna=True)
+                    - total.mean("longitude", skipna=True)).max())
+    peak = float(abs(total.mean("longitude", skipna=True)).max())
+    assert gap / peak > 1e-3
