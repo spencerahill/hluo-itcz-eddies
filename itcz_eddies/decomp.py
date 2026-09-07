@@ -42,7 +42,7 @@ from __future__ import annotations
 import numpy as np
 import xarray as xr
 
-from .columns import col_avg, nantrapz
+from .columns import nantrapz
 from .names import LEV_STR, LON_STR, TIME_STR
 
 __all__ = [

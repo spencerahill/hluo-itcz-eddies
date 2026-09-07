@@ -35,15 +35,13 @@ whose round-trip error depends on the residual's spatial spectrum, measured in
 
 from __future__ import annotations
 
-import numpy as np
-import xarray as xr
 from puffins.budget_adj import resid_after_col_adj, uv_col_budg_adj
 from puffins.constants import C_P as C_P_PUFFINS
 from puffins.constants import GRAV_EARTH, L_V
 from puffins.thermodynamics import moist_static_energy as _puffins_mse
 
 from .derivatives import ddt
-from .names import LAT_STR, LEV_STR, LON_STR, TIME_STR
+from .names import LAT_STR, LON_STR, TIME_STR
 
 __all__ = [
     "C_P_SCRIPTS",
