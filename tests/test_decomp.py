@@ -20,6 +20,7 @@ from itcz_eddies.decomp import (
     decompose,
     lanczos_time_mean,
     legacy_decompose,
+    zonal_mean,
 )
 
 FIVE_TERMS = ["mmc", "stationary", "transient",
@@ -65,7 +66,7 @@ def _relative_gap(terms, names):
 def test_the_six_pointwise_terms_sum_to_the_flux(wind_and_mse, time_mean):
     """At every gridpoint, for any time-mean operator."""
     v, mse = wind_and_mse
-    terms = decompose(v, mse, time_mean=time_mean, zonal_mean=False).dropna("time")
+    terms = decompose(v, mse, time_mean=time_mean, zonal_mean_terms=False).dropna("time")
     assert _relative_gap(terms, SIX_TERMS) < 1e-12
 
 
@@ -203,7 +204,7 @@ def test_the_split_fails_under_a_longitude_dependent_column_integral(
     p_sfc_time_mean = p_sfc.isel(time=0, drop=True)
     dp = dp_from_sfc_pressure(level, p_sfc_time_mean)
 
-    pointwise = decompose(v, mse, zonal_mean=False).dropna("time")
+    pointwise = decompose(v, mse, zonal_mean_terms=False).dropna("time")
     reduced = {name: col_int(pointwise[name], dp).mean("longitude")
                for name in SIX_TERMS + ["total"]}
 
@@ -284,3 +285,74 @@ def test_the_published_split_does_not_close(grid, wind_and_mse, p_sfc):
                     - total.mean("longitude", skipna=True)).max())
     peak = float(abs(total.mean("longitude", skipna=True)).max())
     assert gap / peak > 1e-3
+
+
+# ------------------------------------------- the mass-weighted zonal mean
+
+
+def test_the_mass_weighted_zonal_mean_closes_the_five_term_split(
+    grid, wind_and_mse, p_sfc
+):
+    """Weighting the zonal mean by layer mass restores closure under terrain.
+
+    Same reduction as the failing test above, integrating each longitude to its
+    own surface pressure and then averaging around the latitude circle.  The
+    only change is that the zonal means inside the split are weighted by the
+    layer thicknesses, so the departure from the mean has zero mass-weighted
+    zonal integral at every level.  This is F16 in
+    ``code-review/FINDINGS.md``.
+    """
+    v, mse = wind_and_mse
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    p_sfc_time_mean = p_sfc.isel(time=0, drop=True)
+    dp = dp_from_sfc_pressure(level, p_sfc_time_mean)
+
+    unweighted = decompose(v, mse, zonal_mean_terms=False).dropna("time")
+    weighted = decompose(v, mse, zonal_mean_terms=False,
+                         weights=dp).dropna("time")
+
+    def five_term_gap(terms):
+        reduced = {name: col_int(terms[name], dp).mean("longitude")
+                   for name in FIVE_TERMS + ["total"]}
+        five = sum(reduced[name] for name in FIVE_TERMS)
+        return (float(abs(five - reduced["total"]).max())
+                / float(abs(reduced["total"]).max()))
+
+    assert five_term_gap(unweighted) > 1e-4
+    assert five_term_gap(weighted) < 1e-12
+
+
+def test_the_weighting_leaves_the_transient_and_cross_terms_alone(
+    grid, wind_and_mse, p_sfc
+):
+    """Only the terms built from a zonal mean of a time-mean field can move.
+
+    The transient term is the product of two departures from the time mean and
+    the two cross terms pair a time mean with a departure from it, so none of
+    the three involves a zonal mean and none can change when the zonal mean is
+    reweighted.  Asserting that is what makes the mean-circulation and
+    stationary-eddy changes attributable to the reweighting alone.
+    """
+    v, mse = wind_and_mse
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    dp = dp_from_sfc_pressure(level, p_sfc.isel(time=0, drop=True))
+
+    unweighted = decompose(v, mse, zonal_mean_terms=False).dropna("time")
+    weighted = decompose(v, mse, zonal_mean_terms=False, weights=dp).dropna("time")
+
+    for name in ["transient", "cross_mean_wind_eddy_mse",
+                 "cross_eddy_wind_mean_mse", "total"]:
+        assert np.array_equal(unweighted[name].values, weighted[name].values), name
+
+    moved = float(abs(weighted["mmc"] - unweighted["mmc"]).max())
+    assert moved > 0.0
+
+
+def test_zonal_mean_helper_reduces_to_the_arithmetic_mean(wind_and_mse):
+    """With uniform weights the weighted mean is the plain one."""
+    v, _ = wind_and_mse
+    plain = zonal_mean(v)
+    uniform = zonal_mean(v, weights=xr.ones_like(v))
+    xr.testing.assert_allclose(plain, uniform, rtol=1e-14)

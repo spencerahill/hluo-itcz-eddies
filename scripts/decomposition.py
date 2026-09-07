@@ -21,6 +21,15 @@ three are open decisions at the top of ``code-review/FINDINGS.md``:
 ``--barotropic-correction``
     Whether to subtract the column mean of the zonal-mean wind from the
     mean-circulation term alone, which the published code does.
+``--zonal-mean``
+    ``plain`` is the arithmetic average around a latitude circle, which the
+    published code uses.  ``mass-weighted`` weights each longitude by that
+    level's layer thickness.  Measured in
+    ``code-review/checks/zonal_mean_weighting.py``, the weighted form closes
+    the five-term split to 7.0e-16 of the peak under a column integral taken
+    to each longitude's own surface pressure, where the plain form leaves
+    1.0e-3.  It also redefines the stationary eddy as the departure from a
+    mass-weighted zonal mean.
 
 Every output file carries the full configuration in its attributes and in its
 directory name, so two configurations cannot overwrite one another.
@@ -84,6 +93,9 @@ def parse_args(argv=None):
                         default="boxcar")
     parser.add_argument("--barotropic-correction", action="store_true",
                         help="reproduce the published treatment of the MMC wind")
+    parser.add_argument("--zonal-mean", choices=["plain", "mass-weighted"],
+                        default="plain",
+                        help="how longitudes are weighted in the zonal mean")
     parser.add_argument("--out", type=pathlib.Path, default=None,
                         help="output directory; default is $ITCZ_PRODUCT_ROOT "
                              "plus a subdirectory naming the configuration")
@@ -98,7 +110,8 @@ def parse_args(argv=None):
 def config_tag(args):
     """A directory name that says which configuration produced the files."""
     barotropic = "withB" if args.barotropic_correction else "noB"
-    return f"{args.quadrature}_{args.time_mean}_{barotropic}"
+    weighting = "massZM" if args.zonal_mean == "mass-weighted" else "plainZM"
+    return f"{args.quadrature}_{args.time_mean}_{barotropic}_{weighting}"
 
 
 def months_of(year):
@@ -180,6 +193,12 @@ def main(argv=None):
                         format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args(argv)
 
+    if args.barotropic_correction and args.zonal_mean != "plain":
+        raise SystemExit(
+            "--barotropic-correction reproduces the published calculation, "
+            "which takes an arithmetic zonal mean; it cannot be combined with "
+            "--zonal-mean mass-weighted"
+        )
     if args.barotropic_correction and args.time_mean != "boxcar":
         raise SystemExit(
             "--barotropic-correction reproduces the published calculation, "
@@ -198,8 +217,11 @@ def main(argv=None):
         terms["total"] = xr.where(mask == 1, v, np.nan) * xr.where(
             mask == 1, mse, np.nan)
     else:
+        weights = None
+        if args.zonal_mean == "mass-weighted":
+            weights = dp_from_sfc_pressure(mse["level"], p_sfc)
         terms = decompose(v, mse, time_mean=TIME_MEANS[args.time_mean],
-                          zonal_mean=False,
+                          zonal_mean_terms=False, weights=weights,
                           temporal_resolution=args.temporal_resolution)
 
     reduced = reduce_terms(terms, args, p_sfc, mask)
@@ -217,6 +239,7 @@ def main(argv=None):
         "quadrature": args.quadrature,
         "time_mean": args.time_mean,
         "barotropic_correction": str(args.barotropic_correction),
+        "zonal_mean": args.zonal_mean,
         "boundary": " ".join(str(b) for b in args.boundary),
         "temporal_resolution_hours": args.temporal_resolution,
         "spatial_resolution_degrees": args.spatial_resolution,

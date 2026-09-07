@@ -32,6 +32,18 @@ a decision recorded at the top of ``code-review/FINDINGS.md``.
    taken to each longitude's own surface pressure, which is where the published
    38% gap comes from.  See ``columns`` for that half.
 
+**The zonal mean has a weighting, and it decides whether five terms suffice.**
+With an arithmetic zonal mean, the five-term split above closes exactly at each
+pressure level, and stops closing once the terms are column-integrated to each
+longitude's own surface pressure, because that integral weights longitudes
+unequally.  Defining the zonal mean at each level as the average weighted by
+that level's layer thickness restores the closure, since the departure from it
+then has zero mass-weighted zonal integral by construction.  Measured in
+``code-review/checks/zonal_mean_weighting.py``: 7.0e-16 of the peak with the
+weighting against 1.0e-3 without it.  Pass ``weights=dp`` to ``decompose`` to
+get it.  What changes is the definition of the stationary eddy, which becomes
+the departure from a mass-weighted rather than an arithmetic zonal mean.
+
 ``legacy_decompose`` reproduces the published calculation, difference by
 difference, so the current figures can be regenerated.  ``decompose`` computes
 the exact split.
@@ -49,10 +61,33 @@ __all__ = [
     "boxcar_time_mean",
     "block_time_mean",
     "lanczos_time_mean",
+    "zonal_mean",
     "decompose",
     "legacy_decompose",
     "barotropic_correction",
 ]
+
+
+def zonal_mean(arr, weights=None, lon_str=LON_STR):
+    """Average around a latitude circle, optionally weighted by layer mass.
+
+    With ``weights`` left as ``None`` this is the arithmetic mean, taken with
+    ``skipna=False`` so a NaN anywhere on the circle propagates rather than
+    changing the denominator.
+
+    With ``weights`` set to the layer thicknesses from
+    ``columns.dp_from_sfc_pressure``, it is the mass-weighted mean
+
+        sum_lon (arr * dp) / sum_lon dp
+
+    at each level.  The departure from that mean has zero mass-weighted zonal
+    integral at every level by construction, which is what makes the five-term
+    split survive a column integral taken to each longitude's own surface.
+    """
+    if weights is None:
+        return arr.mean(lon_str, skipna=False)
+    return ((arr * weights).sum(lon_str, skipna=False)
+            / weights.sum(lon_str, skipna=False))
 
 
 # ------------------------------------------------------------ time averaging
@@ -136,14 +171,14 @@ def lanczos_time_mean(arr, temporal_resolution=12, cutoff_days=30, lobes=60,
 
 
 def decompose(v, mse, time_mean=boxcar_time_mean, lon_str=LON_STR,
-              zonal_mean=True, **kwargs):
+              zonal_mean_terms=True, weights=None, **kwargs):
     r"""Split the meridional MSE flux into its exact terms.
 
-    With ``zonal_mean=True``, the default, every term is a zonal mean and the
+    With ``zonal_mean_terms=True``, the default, every term is a zonal mean and the
     returned fields carry no longitude dimension.  The five terms then sum to
     :math:`[vh]` exactly.
 
-    With ``zonal_mean=False`` the terms are returned as four-dimensional
+    With ``zonal_mean_terms=False`` the terms are returned as four-dimensional
     fields, and a sixth term appears, ``zonal_cross``, equal to
     :math:`[\bar v]\bar h^* + \bar v^*[\bar h]`.  Its zonal mean is zero by
     construction, which is why the five-term form does not need it, and it is
@@ -175,8 +210,13 @@ def decompose(v, mse, time_mean=boxcar_time_mean, lon_str=LON_STR,
         Default is the published 30-day centred rolling mean.
     lon_str
         Name of the longitude dimension.
-    zonal_mean
+    zonal_mean_terms
         Whether to return the zonal-mean terms or the four-dimensional ones.
+    weights
+        Layer thicknesses, from ``columns.dp_from_sfc_pressure``.  When given,
+        every zonal mean here is weighted by them.  That is what makes the
+        five-term form close under a column integral taken to each longitude's
+        own surface pressure; see the module docstring.
     **kwargs
         Passed through to ``time_mean``.
 
@@ -198,7 +238,7 @@ def decompose(v, mse, time_mean=boxcar_time_mean, lon_str=LON_STR,
     ``cross_eddy_wind_mean_mse``
         :math:`v' \bar h`, likewise.
     ``zonal_cross``
-        Only when ``zonal_mean=False``.  See above.
+        Only when ``zonal_mean_terms=False``.  See above.
     ``total``
         :math:`vh`, computed directly rather than as the sum, so that the
         closure of the terms is a real check.
@@ -208,8 +248,8 @@ def decompose(v, mse, time_mean=boxcar_time_mean, lon_str=LON_STR,
     v_prime = v - v_bar
     h_prime = mse - h_bar
 
-    v_bar_zm = v_bar.mean(lon_str, skipna=False)
-    h_bar_zm = h_bar.mean(lon_str, skipna=False)
+    v_bar_zm = zonal_mean(v_bar, weights=weights, lon_str=lon_str)
+    h_bar_zm = zonal_mean(h_bar, weights=weights, lon_str=lon_str)
     v_bar_star = v_bar - v_bar_zm
     h_bar_star = h_bar - h_bar_zm
 
@@ -221,10 +261,10 @@ def decompose(v, mse, time_mean=boxcar_time_mean, lon_str=LON_STR,
         "cross_eddy_wind_mean_mse": v_prime * h_bar,
         "total": v * mse,
     }
-    if zonal_mean:
+    if zonal_mean_terms:
         return xr.Dataset(
             {name: (arr if lon_str not in arr.dims
-                    else arr.mean(lon_str, skipna=False))
+                    else zonal_mean(arr, weights=weights, lon_str=lon_str))
              for name, arr in terms.items()}
         )
     terms["zonal_cross"] = v_bar_zm * h_bar_star + v_bar_star * h_bar_zm
