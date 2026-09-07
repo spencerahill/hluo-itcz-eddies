@@ -8,7 +8,6 @@ import gc, logging, os,copy,glob,sys
 import myfun as wf
 import calendar
 from scipy.integrate import quad
-from scipy.special import sph_harm
 from windspharm.xarray import VectorWind
 
 def read_data(fname,varname,temporal_resolution,spatial_resolution):

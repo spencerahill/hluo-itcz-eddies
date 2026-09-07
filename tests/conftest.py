@@ -52,16 +52,17 @@ def decomp_script():
 
 @pytest.fixture(scope="session")
 def zero_mask_script():
-    """``main/div_vMSE_calculation.py`` as a module.
+    """``MSEadjust/main.py`` as a module, imported under the name ``main``.
 
-    Used only for its ``maskout``, which is the body that fills below ground
-    with 0 and which 12 of the scripts share, ``MSEadjust/main.py`` among
-    them.  ``MSEadjust/main.py`` itself cannot be imported under scipy 1.17 or
-    later, because its line 11 reads ``from scipy.special import sph_harm``
-    and scipy removed that name; ``sph_harm`` is never called in any of the
-    three files that import it.
+    Used for its ``maskout``, the body that fills below ground with 0 and
+    which 12 of the scripts share.  ``main/`` goes on the path first because
+    the module does ``import myfun as wf``.
     """
-    return _import_from(MAIN_DIR, "div_vMSE_calculation")
+    sys.path.insert(0, str(MAIN_DIR))
+    try:
+        return _import_from(ADJUST_DIR, "main")
+    finally:
+        sys.path.remove(str(MAIN_DIR))
 
 
 LEVELS = np.array(

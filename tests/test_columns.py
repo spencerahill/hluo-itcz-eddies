@@ -181,8 +181,9 @@ def test_sfc_pressure_mask_matches_the_originals(
 ):
     """Bitwise agreement with both in-script ``maskout`` bodies.
 
-    Twelve scripts fill below ground with 0 and two with NaN; those are the
-    only two bodies in use.
+    ``MSEadjust/main.py`` fills below ground with 0 and the decomposition
+    script with NaN.  Twelve scripts share the first body and two the second;
+    those are the only two in use.
     """
     original = (decomp_script.maskout if np.isnan(below_ground)
                 else zero_mask_script.maskout)
