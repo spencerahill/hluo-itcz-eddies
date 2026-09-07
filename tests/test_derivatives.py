@@ -117,3 +117,30 @@ def test_ddx_carries_the_cosine_of_latitude(arr4d):
     expected = (arr4d.differentiate("longitude") / 111.2e3
                 / np.cos(arr4d.latitude * np.pi / 180.0)).transpose(*zonal.dims)
     assert np.array_equal(zonal.values, expected.values)
+
+
+def test_ddt_rejects_a_decoded_time_coordinate(myfun, arr4d):
+    """F9: with a datetime64 time coordinate the original is silently wrong.
+
+    ``myfun.ddt`` returns a rate per xarray's ``datetime_unit`` rather than per
+    hour, and every caller then divides by 3600 as though it were per hour.
+    The size of the resulting error is the ratio of that unit to an hour, which
+    is a property of the xarray version rather than of this code: on xarray
+    2026.7.0 the unit is seconds and the factor is 3600.  Asserting the exact
+    value here is deliberate, so that an xarray release that changes the
+    default announces itself.
+    """
+    hours = arr4d.time.values * 12.0
+    decoded = arr4d.assign_coords(
+        time=np.datetime64("1997-01-01T00") + hours.astype("timedelta64[h]")
+    )
+    per_hour = ddt(arr4d.assign_coords(time=hours))
+    per_datetime_unit = myfun.ddt(decoded)
+
+    ratio = (per_hour / per_datetime_unit.assign_coords(time=per_hour.time)).values
+    finite = ratio[np.isfinite(ratio) & (np.abs(ratio) > 0)]
+    assert finite.size > 0
+    assert np.allclose(finite, 3600.0, rtol=1e-9)
+
+    with pytest.raises(TypeError, match="decode_times"):
+        ddt(decoded)

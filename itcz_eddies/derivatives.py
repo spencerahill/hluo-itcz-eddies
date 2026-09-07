@@ -21,9 +21,12 @@ encoded.**  Every script that calls ``ddt`` opens its files with
 ``decode_times=False``, so the ``time`` coordinate is a plain count of hours
 and ``xr.DataArray.differentiate`` returns a per-hour rate, which the callers
 then divide by 3600 to get per second.  Handed a decoded ``datetime64``
-coordinate, ``differentiate`` returns a per-nanosecond rate instead, and the
-answer is too small by 3.6e12 with nothing raising.  This is F9 in
-``code-review/FINDINGS.md``.
+coordinate, ``differentiate`` uses its ``datetime_unit`` default instead, and
+the answer is wrong by the ratio of that unit to an hour, with nothing raising.
+Measured here on xarray 2026.7.0 the default is seconds, so the callers' result
+comes out 3600 times too small.  The size of the error therefore depends on the
+xarray version, which is the point of F9 in ``code-review/FINDINGS.md``.
+``ddt`` raises on a datetime coordinate instead of returning any of them.
 """
 
 from __future__ import annotations
@@ -59,7 +62,25 @@ def ddt(arr: xr.DataArray, per_second: bool = False) -> xr.DataArray:
     per_second
         When ``True``, divide by 3600 so the result is per second.  Every
         caller of the original ``ddt`` does this division itself.
+
+    Raises
+    ------
+    TypeError
+        If the ``time`` coordinate holds datetimes.  ``myfun.ddt`` returns a
+        rate per ``datetime_unit`` in that case, which on xarray 2026.7.0 is
+        per second, so every caller's subsequent division by 3600 leaves the
+        answer 3600 times too small.  Nothing in the original signals it.
+        This is F9 in ``code-review/FINDINGS.md``.
     """
+    if np.issubdtype(arr[TIME_STR].dtype, np.datetime64):
+        raise TypeError(
+            "ddt needs an undecoded time coordinate, in hours. This array's "
+            "time coordinate is datetime64, for which xarray's differentiate "
+            "returns a rate per its datetime_unit rather than per hour, so "
+            "every caller's division by 3600 leaves the answer wrong by the "
+            "ratio of that unit to an hour. Open the files with "
+            "decode_times=False, or convert the derivative yourself."
+        )
     out = _canonical(arr.differentiate(TIME_STR))
     return out / SECONDS_PER_HOUR if per_second else out
 
