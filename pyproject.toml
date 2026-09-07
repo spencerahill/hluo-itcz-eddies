@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "itcz-eddies"
+version = "0.1.0"
+description = "Analysis code for the ITCZ transient-eddy MSE flux manuscript"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Haochang Luo" },
+  { name = "Spencer A. Hill", email = "shill1@ccny.cuny.edu" },
+]
+dependencies = [
+  "dask",
+  "matplotlib",
+  "netcdf4",
+  "numpy",
+  "puffins",
+  "scipy",
+  "xarray",
+]
+
+[project.optional-dependencies]
+# windspharm needs a Fortran compiler; install it with
+# conda install -c conda-forge windspharm
+fortran = ["windspharm"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["itcz_eddies*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

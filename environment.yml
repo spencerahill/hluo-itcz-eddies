@@ -1,0 +1,25 @@
+name: itcz-eddies
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - xarray
+  - netcdf4
+  - dask
+  - matplotlib
+  - cartopy
+  - windspharm
+  - pytest
+  # puffins dependencies that conda-forge builds
+  - scikit-learn
+  - statsmodels
+  - eofs
+  - pip
+  - pip:
+    - pymannkendall
+    - faceted
+    # puffins itself is installed from a local checkout:
+    #   pip install -e /path/to/puffins --no-deps
