@@ -7,9 +7,14 @@ and Michela Biasutti.
 ## Two code trees
 
 `main/` and `MSEadjust/` hold the original scripts, as Haochang Luo wrote and
-ran them on NCAR's Derecho and Casper. Nothing in them has been changed. They
-are the specification of what the published figures show, and they are what
-the golden-master test runs against.
+ran them on NCAR's Derecho and Casper. They are the specification of what the
+published figures show, and they are what the golden-master test runs against.
+
+One line has been changed in them. `MSEadjust/main.py`, `main_v.py` and
+`examine.py` each carried `from scipy.special import sph_harm` and never called
+it, and scipy removed that name, so all three failed at import before executing
+a statement. The import is deleted; nothing else in either directory differs
+from what Haochang Luo ran.
 
 `itcz_eddies/` is a Python package holding the same calculations as importable,
 testable functions, with the duplication removed and with the pieces that
