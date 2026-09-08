@@ -59,7 +59,7 @@ __all__ = [
 
 # The value of gravity hardcoded throughout Haochang Luo's scripts.  The
 # manuscript's Appendix A states 9.81, a 0.1% disagreement recorded as F8 in
-# code-review/FINDINGS.md.  puffins.constants.GRAV_EARTH is 9.80665.
+# code-review/FINDINGS.md.  puffins.constants.GRAV_EARTH is 9.81.
 GRAV_HAOCHANG = 9.8
 
 # Placeholder for the interface below the lowest level, in hPa.  It only has
