@@ -59,6 +59,25 @@ def test_dp_is_zero_below_ground_and_partial_at_the_surface(grid):
     assert dp.sel(level=800.0).values == pytest.approx(100.0)  # 850 - 750, full
 
 
+@pytest.mark.parametrize("p_sfc_hpa", [1013.0, 1025.0, 1039.0, 1080.0])
+def test_dp_keeps_the_surface_layer_when_the_surface_is_below_1012_hPa(
+    grid, p_sfc_hpa
+):
+    """F21: a surface pressure above the old 1012.5 hPa placeholder lost mass.
+
+    The lowest level's layer must extend from its upper interface, midway
+    between the two lowest levels, all the way down to the surface, so the
+    thicknesses still sum to (p_sfc - p_top).  July 1997 surface pressures
+    reach 1039 hPa.
+    """
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    upper_interface = 0.5 * (grid["level"][-2] + grid["level"][-1])
+    dp = dp_from_sfc_pressure(level, xr.DataArray(p_sfc_hpa)) / 100.0
+    assert dp.sel(level=1000.0).values == pytest.approx(p_sfc_hpa - upper_interface)
+    assert float(dp.sum("level")) == pytest.approx(p_sfc_hpa - grid["level"][0])
+
+
 def test_dp_is_independent_of_level_ordering(grid, p_sfc):
     """Descending levels, as ERA5 stores them, give the same thicknesses."""
     level = xr.DataArray(grid["level"], dims="level",

@@ -62,6 +62,11 @@ __all__ = [
 # code-review/FINDINGS.md.  puffins.constants.GRAV_EARTH is 9.80665.
 GRAV_HAOCHANG = 9.8
 
+# Placeholder for the interface below the lowest level, in hPa.  It only has
+# to lie below every physical surface pressure; Earth's record is about
+# 1085 hPa.
+P_BOTTOM_PLACEHOLDER_HPA = 1100.0
+
 
 def nantrapz(y, x=None, dx=1.0, dim=None):
     """Trapezoid rule along ``dim`` that skips NaN trapezoids.
@@ -195,10 +200,15 @@ def dp_from_sfc_pressure(level, p_sfc, p_top=None, lev_str=LEV_STR):
     interfaces = np.empty(ordered.size + 1, dtype="float64")
     interfaces[1:-1] = 0.5 * (ordered[:-1] + ordered[1:])
     interfaces[0] = ordered[0] if p_top is None else float(p_top)
-    # The bottom interface is only a placeholder; the clip below replaces it
-    # wherever the surface is shallower, and the surface is always shallower
-    # than this value for any physical surface pressure.
-    interfaces[-1] = ordered[-1] + 0.5 * (ordered[-1] - ordered[-2])
+    # The bottom interface is a placeholder that the clip below replaces with
+    # the surface pressure, so it has to lie below every surface pressure the
+    # data can hold.  Until 2026-09-08 it was the midpoint-style value one
+    # half-spacing below the bottom level, 1012.5 hPa on ERA5's levels, and
+    # every column whose surface pressure exceeded that was silently
+    # truncated there: up to 27 hPa of the surface layer lost where the
+    # surface pressure reached 1039 hPa in July 1997 (F21 in
+    # code-review/FINDINGS.md).
+    interfaces[-1] = P_BOTTOM_PLACEHOLDER_HPA
 
     if not ascending:
         interfaces = interfaces[::-1]
