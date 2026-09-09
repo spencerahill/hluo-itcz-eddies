@@ -55,11 +55,12 @@ flanking months, those are read; otherwise the daily ERA5 files are read
 directly, which is about 1,700 files for one year.
 
 How the exact split is computed.  The fields for the year plus flanks are
-loaded once as float32, and the split runs in float64 over bands of
+read one band at a time as float32, and the split runs in float64 over bands of
 ``--lat-band`` latitudes, since every operation in it (the time mean, the
 zonal mean, the column integral) acts within a latitude.  A band of ten
 latitudes on the 60S to 60N half-degree grid is about 1.8 GB per float64
-field, and the whole run stays under about 100 GB.
+field at twelve samples a day and twice that at six, and only one band is
+held at a time.
 
 Every output file carries the full configuration in its attributes and in its
 directory name, so two configurations cannot overwrite one another.  Besides
@@ -69,9 +70,27 @@ and MSE and the zonal-mean layer thickness on (time, level, latitude), from
 which any barotropic correction of the mean-circulation term can be formed
 without rerunning.
 
+Since 2026-09-09 the assembled fields come from ``scripts/assemble_fields.py``
+in its corrected mode, and the defaults here are the pipeline of
+``pipeline-2026-09-09/pipeline-recommendation.pdf`` at the project root: the
+mass-flux split with the Lanczos low-pass at 30 days over 481 weights
+(``--lanczos-lobes 240`` at six-hourly sampling is the 60-day half window
+of decision D4, so ``--flank-months 3``), four samples a day (decision D6),
+interfaces midway in log pressure (``--interfaces``, passed to the layer
+thickness, decision D1), and the fields read from the subdirectory of
+``ITCZ_FIELDS_ROOT`` that the assembly names for the configuration
+(``--fields-tag``, ``auto`` by default; the empty tag reads the root, where
+the archived-mode files of 2026-09-08 sit).  When the fields files carry
+the assembly's zonal-mean net mass transport series, their time means go
+into ``zonal_mean_fields_YYYY.nc`` as ``net_mass_daily_bar`` and
+``net_mass_corr_bar``, from which the reduce step of
+``code-review/checks/zonal_mean_weighting_era5.py`` forms the
+mean-circulation term with its net mass transport taken from the daily-mean
+requirement (decision D6).
+
 Usage:
   python scripts/decomposition.py --year 1997
-  python scripts/decomposition.py --year 1997 --quadrature trapezoid \
+  python scripts/decomposition.py --year 1997 --quadrature trapezoid --split wind \
       --time-mean boxcar --barotropic-correction
 """
 
@@ -136,22 +155,23 @@ def parse_args(argv=None):
     parser.add_argument("--quadrature", choices=["mass", "trapezoid"],
                         default="mass")
     parser.add_argument("--time-mean", choices=sorted(TIME_MEANS),
-                        default="boxcar")
+                        default="lanczos")
     parser.add_argument("--lanczos-cutoff-days", type=float, default=30.0,
                         help="low-pass cutoff period for lanczos and ideal "
                              "(decision 3)")
-    parser.add_argument("--flank-months", type=int, default=1,
+    parser.add_argument("--flank-months", type=int, default=3,
                         help="months read either side of the year for the "
                              "time mean, then dropped")
-    parser.add_argument("--lanczos-lobes", type=int, default=60,
+    parser.add_argument("--lanczos-lobes", type=int, default=240,
                         help="half-width of the Lanczos window in time steps; "
-                             "the window has 2*lobes+1 weights (decision 3)")
+                             "the window has 2*lobes+1 weights; 240 at six-hourly "
+                             "sampling is the 60-day half window of decision D4")
     parser.add_argument("--barotropic-correction", action="store_true",
                         help="reproduce the published treatment of the MMC wind")
     parser.add_argument("--zonal-mean", choices=["plain", "mass-weighted"],
                         default="plain",
                         help="how longitudes are weighted in the zonal mean")
-    parser.add_argument("--split", choices=["wind", "mass-flux"], default="wind",
+    parser.add_argument("--split", choices=["wind", "mass-flux"], default="mass-flux",
                         help="split the wind and the MSE (five zonal-mean terms plus "
                              "the sixth pointwise term), or the layer mass flux "
                              "v dp/g and the MSE (five terms, exact under a moving "
@@ -166,8 +186,16 @@ def parse_args(argv=None):
     parser.add_argument("--boundary", type=float, nargs=4,
                         default=[-60.0, 60.0, 0.0, 360.0],
                         metavar=("LAT0", "LAT1", "LON0", "LON1"))
-    parser.add_argument("--temporal-resolution", type=float, default=12.0)
+    parser.add_argument("--temporal-resolution", type=float, default=6.0)
     parser.add_argument("--spatial-resolution", type=float, default=0.5)
+    parser.add_argument("--interfaces", choices=["logp", "midpoint"], default="logp",
+                        help="where the layer interfaces sit in the layer thickness "
+                             "(decision D1)")
+    parser.add_argument("--fields-tag", default="auto",
+                        help="subdirectory of $ITCZ_FIELDS_ROOT holding the assembled "
+                             "fields; auto names the corrected assembly at this "
+                             "sampling and these interfaces, and an empty string "
+                             "names the root")
     return parser.parse_args(argv)
 
 
@@ -182,7 +210,15 @@ def config_tag(args):
         time_mean = f"lanczos{args.lanczos_cutoff_days:g}d{args.lanczos_lobes}"
     elif time_mean == "ideal":
         time_mean = f"ideal{args.lanczos_cutoff_days:g}d"
-    return f"{args.quadrature}_{time_mean}_{barotropic}_{weighting}"
+    return (f"{args.quadrature}_{time_mean}_{barotropic}_{weighting}"
+            f"_{args.temporal_resolution:g}h_{args.interfaces}")
+
+
+def fields_tag(args):
+    """The subdirectory of the fields root the run reads, from ``--fields-tag``."""
+    if args.fields_tag != "auto":
+        return args.fields_tag
+    return paths.fields_tag("corrected", args.temporal_resolution, args.interfaces)
 
 
 def time_mean_kwargs(args):
@@ -272,7 +308,7 @@ def fields_files(args):
     """
     files = []
     for year, month in months_of(args.year, args.flank_months):
-        path = paths.fields_file(year, month)
+        path = paths.fields_file(year, month, tag=fields_tag(args))
         if path.exists():
             files.append(path)
         elif year == args.year:
@@ -285,22 +321,39 @@ def fields_files(args):
 
 
 def read_year_from_fields(args, files):
-    """v, MSE and surface pressure from the assembled monthly files, lazily."""
+    """v, MSE and surface pressure from the assembled monthly files, lazily,
+    with the assembly's zonal-mean net mass transport series loaded, or
+    ``None`` for files of the archived mode, which carry none."""
     logging.info("reading %d assembled fields files from %s", len(files),
                  files[0].parent)
-    ds = xr.open_mfdataset(files, concat_dim="time", combine="nested")
+    ds = xr.open_mfdataset(files, concat_dim="time", combine="nested",
+                           chunks={"latitude": args.lat_band})
     lat0, lat1, lon0, lon1 = args.boundary
     ds = ds.sel(latitude=slice(min(lat0, lat1), max(lat0, lat1)),
                 longitude=slice(min(lon0, lon1), max(lon0, lon1)))
-    return ds["v_adj"], ds["mse"], ds["p_sfc"]
+    series = None
+    if all(name in ds for name in ("net_mass_daily", "net_mass_corr_zm")):
+        series = ds[["net_mass_daily", "net_mass_corr_zm"]].load()
+    else:
+        logging.warning("the fields files carry no net mass transport series "
+                        "(archived mode), so the zonal-mean fields will not "
+                        "carry the daily-mean net mass transport of decision D6")
+    return ds["v_adj"], ds["mse"], ds["p_sfc"], series
 
 
 def read_year(args):
     files = fields_files(args)
     if files is None:
+        if args.temporal_resolution != 12:
+            raise SystemExit(
+                f"no assembled fields for {args.year} under "
+                f"{paths.fields_root() / fields_tag(args)}; reading ERA5 directly "
+                "applies the archived adjustment, which exists at 00 and 12 UTC "
+                "only, so run scripts/assemble_fields.py first"
+            )
         logging.info("no assembled fields for %d under %s; reading ERA5 directly",
                      args.year, paths.fields_root())
-        return read_year_from_era5(args), "era5"
+        return read_year_from_era5(args) + (None,), "era5"
     return read_year_from_fields(args, files), "fields"
 
 
@@ -322,10 +375,11 @@ def exact_split_by_band(v, mse, p_sfc, args):
     for i0 in range(0, n_lat, band):
         started = _time.monotonic()
         sl = slice(i0, min(i0 + band, n_lat))
-        vb = v.isel(latitude=sl).astype("float64")
-        hb = mse.isel(latitude=sl).astype("float64")
-        pb = p_sfc.isel(latitude=sl).astype("float64")
-        dp = dp_from_sfc_pressure(vb["level"], pb).transpose(*vb.dims)
+        vb = v.isel(latitude=sl).astype("float64").load()
+        hb = mse.isel(latitude=sl).astype("float64").load()
+        pb = p_sfc.isel(latitude=sl).astype("float64").load()
+        dp = dp_from_sfc_pressure(vb["level"], pb, interfaces=args.interfaces
+                                  ).transpose(*vb.dims)
         if args.split == "mass-flux":
             # The split of the layer mass flux: the column integral is the
             # sum over levels, since dp/g is inside every term, and five
@@ -390,6 +444,26 @@ def exact_split_by_band(v, mse, p_sfc, args):
             worst_gap)
 
 
+def attach_series_time_means(zonal_mean_fields, series, args):
+    """The run's time mean of the assembly's zonal-mean net mass transport series.
+
+    ``net_mass_daily_bar`` is the mean-circulation term's net mass transport
+    under decision D6, the daily-mean requirement plus the corrected wind's
+    vapor transport, time-averaged as the terms are; ``net_mass_corr_bar`` is
+    the same for the corrected wind's own column mass transport, which must
+    equal the level sum of ``m_bar_zm`` to rounding, an identity control the
+    reduce step of ``code-review/checks/zonal_mean_weighting_era5.py`` prints.
+    """
+    kwargs = time_mean_kwargs(args)
+    time_mean = TIME_MEANS[args.time_mean]
+    lat = zonal_mean_fields["latitude"]
+    for src, dest in (("net_mass_daily", "net_mass_daily_bar"),
+                      ("net_mass_corr_zm", "net_mass_corr_bar")):
+        arr = series[src].sel(latitude=lat).astype("float64")
+        zonal_mean_fields[dest] = time_mean(arr, **kwargs)
+    return zonal_mean_fields
+
+
 # ------------------------------------------------------- the legacy split
 
 
@@ -436,23 +510,25 @@ def main(argv=None):
             "trapezoid rule; under the mass-weighted quadrature the layer that "
             "straddles the surface is NaN and the column integral is undefined"
         )
+    if args.barotropic_correction and args.split != "wind":
+        raise SystemExit(
+            "--barotropic-correction reproduces the published calculation, "
+            "which splits the wind and the MSE; pass --split wind"
+        )
 
-    (v, mse, p_sfc), source = read_year(args)
+    (v, mse, p_sfc, series), source = read_year(args)
     zonal_mean_fields = None
     worst_gap = None
     if args.barotropic_correction:
         reduced = legacy_split(v, mse, p_sfc, args)
     else:
-        started = _time.monotonic()
-        logging.info("loading the fields into memory as float32: %s",
+        logging.info("streaming the fields one latitude band at a time: %s",
                      dict(v.sizes))
-        v = v.astype("float32").load()
-        mse = mse.astype("float32").load()
-        p_sfc = p_sfc.astype("float32").load()
-        gc.collect()
-        logging.info("loaded in %.0f s", _time.monotonic() - started)
         reduced, zonal_mean_fields, worst_gap = exact_split_by_band(
             v, mse, p_sfc, args)
+        if series is not None:
+            zonal_mean_fields = attach_series_time_means(
+                zonal_mean_fields, series, args)
         del v, mse
         gc.collect()
 
@@ -476,6 +552,8 @@ def main(argv=None):
         "zonal_mean": args.zonal_mean,
         "split": args.split,
         "lat_band": args.lat_band,
+        "interfaces": args.interfaces,
+        "fields_tag": fields_tag(args),
         "input_source": source,
         "boundary": " ".join(str(b) for b in args.boundary),
         "temporal_resolution_hours": args.temporal_resolution,
@@ -512,6 +590,13 @@ def main(argv=None):
                          "J kg-1"),
             "dp_zm": ("arithmetic zonal mean of the layer thickness", "Pa"),
             "dp_bar_zm": ("arithmetic zonal mean of the time-mean layer thickness", "Pa"),
+            "net_mass_daily_bar": ("time mean of the zonal-mean column mass transport "
+                                   "with the dry part from the daily-mean requirement, "
+                                   "the mean-circulation net mass transport of decision "
+                                   "D6", "kg m-1 s-1"),
+            "net_mass_corr_bar": ("time mean of the zonal-mean column mass transport of "
+                                  "the corrected wind, from the assembly; equals the "
+                                  "level sum of m_bar_zm to rounding", "kg m-1 s-1"),
         }
         for name in zonal_mean_fields.data_vars:
             long_name, units = long_names[name]

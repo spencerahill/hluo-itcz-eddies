@@ -7,10 +7,12 @@ from there.  See ``README.md``.
 """
 
 from . import (
+    assembly,
     columns,
     decomp,
     derivatives,
     era5,
+    mass,
     metrics,
     mse,
     names,
@@ -21,10 +23,12 @@ from . import (
 )
 
 __all__ = [
+    "assembly",
     "columns",
     "decomp",
     "derivatives",
     "era5",
+    "mass",
     "metrics",
     "mse",
     "names",

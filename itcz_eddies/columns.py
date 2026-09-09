@@ -161,10 +161,12 @@ def col_int_trapz(data, mask=None, lev_str=LEV_STR, grav=GRAV_HAOCHANG):
     return nantrapz(data, data[lev_str], dim=lev_str) / grav * 100.0
 
 
-def dp_from_sfc_pressure(level, p_sfc, p_top=None, lev_str=LEV_STR):
+def dp_from_sfc_pressure(level, p_sfc, p_top=None, lev_str=LEV_STR,
+                         interfaces="midpoint"):
     """Pressure thickness of each level in Pa, clipped at the surface.
 
-    Interfaces sit midway between adjacent levels in pressure.  The topmost
+    Interfaces sit between adjacent levels, midway in pressure by default or
+    midway in log pressure with ``interfaces="logp"``.  The topmost
     interface is placed at ``p_top``, which defaults to the topmost level
     itself, so the column is integrated from the highest stored level down.
     The bottom of each layer is clipped at the surface pressure, so:
@@ -186,19 +188,33 @@ def dp_from_sfc_pressure(level, p_sfc, p_top=None, lev_str=LEV_STR):
         Surface pressure in hPa, any shape broadcastable against ``level``.
     p_top
         Pressure of the topmost interface in hPa.  Default: the topmost level.
+    interfaces
+        ``"midpoint"`` puts each interface at the arithmetic mean of the two
+        adjacent levels, ``"logp"`` at their geometric mean, which is midway
+        in log pressure.  Decision D1 of the pipeline recommendation of
+        2026-09-09 chose ``"logp"``: against ERA5's own model-level MSE flux
+        for July 1997 it was the closest of seven rules, by 0.07 PW rms over
+        30S to 30N and 0.26 PW at the equator over the midpoint rule
+        (``code-review/checks/quadrature_vs_model_levels.py``, job 5875409).
 
     Returns
     -------
     xarray.DataArray
         Thickness of each level in Pa, named ``dp``.
     """
+    rule = interfaces
     level = xr.DataArray(level) if not isinstance(level, xr.DataArray) else level
     vals = np.asarray(level.values, dtype="float64")
     ascending = bool(vals[0] < vals[-1])
     ordered = vals if ascending else vals[::-1]
 
     interfaces = np.empty(ordered.size + 1, dtype="float64")
-    interfaces[1:-1] = 0.5 * (ordered[:-1] + ordered[1:])
+    if rule == "midpoint":
+        interfaces[1:-1] = 0.5 * (ordered[:-1] + ordered[1:])
+    elif rule == "logp":
+        interfaces[1:-1] = np.sqrt(ordered[:-1] * ordered[1:])
+    else:
+        raise ValueError(f"interfaces must be 'midpoint' or 'logp', got {rule!r}")
     interfaces[0] = ordered[0] if p_top is None else float(p_top)
     # The bottom interface is a placeholder that the clip below replaces with
     # the surface pressure, so it has to lie below every surface pressure the

@@ -100,3 +100,21 @@ def test_centered_tendency_of_a_linear_ramp():
     assert np.allclose(tend.values, 3.0 / 3600.0)
     tend12 = centered_tendency(hourly, at, half_window_hours=12)
     assert np.allclose(tend12.values, 3.0 / 3600.0)
+
+
+def test_a_24_hour_centered_tendency_is_blind_to_the_diurnal_and_semidiurnal_cycles():
+    """The daily-mean requirement of decision D6 comes from ``centered_tendency``
+    with a 12-hour half window: a 24-hour difference cancels every 24-hour and
+    12-hour periodic component exactly and keeps a trend, where the two-hour
+    window the correction uses sees the cycles."""
+    hours = np.arange(0, 24 * 5 + 1, dtype="float64")
+    time = np.datetime64("1997-07-01T00") + hours.astype("timedelta64[h]")
+    series = (2.0 * hours
+              + 30.0 * np.sin(2 * np.pi * hours / 24.0)
+              + 50.0 * np.cos(2 * np.pi * hours / 12.0))
+    x = xr.DataArray(series, dims="time", coords={"time": time})
+    times = time[12:-12:6]
+    daily = centered_tendency(x, times, half_window_hours=12)
+    np.testing.assert_allclose(daily.values, 2.0 / 3600.0, rtol=1e-12)
+    hourly = centered_tendency(x, times, half_window_hours=1)
+    assert float(abs(hourly - 2.0 / 3600.0).max()) > 1.0 / 3600.0

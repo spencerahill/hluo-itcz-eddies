@@ -57,6 +57,7 @@ __all__ = [
     "RAD_EARTH",
     "centered_tendency",
     "dry_air_mass_correction",
+    "mass_correction_from_columns",
     "polar_cap_transport",
 ]
 
@@ -68,6 +69,14 @@ def centered_tendency(hourly, times, half_window_hours=1, time_str=TIME_STR):
 
     ``(x(t + w) - x(t - w)) / (2 w)`` with ``w = half_window_hours``.  Both
     ``t + w`` and ``t - w`` must be present in ``hourly``.
+
+    With ``half_window_hours=1`` this is the instantaneous tendency the mass
+    correction is formed with, which sees the semidiurnal tide as the
+    analyzed divergence does.  With ``half_window_hours=12`` the difference
+    spans 24 hours, cancels every 24-hour and 12-hour periodic component
+    exactly, and includes what the assimilation adds at its window
+    boundaries: it is the daily-mean tendency from which decision D6 takes
+    the mean-circulation term's net mass transport.
     """
     delta = np.timedelta64(half_window_hours, "h")
     later = hourly.sel({time_str: times + delta})
@@ -107,11 +116,29 @@ def dry_air_mass_correction(u, v, sphum, dp, dry_mass_tendency,
     u_col = col_int(u * dry, dp, lev_str=lev_str)
     v_col = col_int(v * dry, dp, lev_str=lev_str)
     mass = col_int(dry, dp, lev_str=lev_str)
-    u_adj, v_adj = adjusted_col_fluxes(u_col, v_col, dry_mass_tendency,
-                                       xr.zeros_like(dry_mass_tendency),
+    du, dv = mass_correction_from_columns(u_col, v_col, mass, dry_mass_tendency,
+                                          lat_str=lat_str, lon_str=lon_str,
+                                          time_str=time_str)
+    return du, dv, mass
+
+
+def mass_correction_from_columns(u_col, v_col, mass, tendency, lat_str=LAT_STR,
+                                 lon_str=LON_STR, time_str=TIME_STR):
+    """The barotropic correction from column integrals already formed.
+
+    ``u_col`` and ``v_col`` are the column mass fluxes whose divergence the
+    budget constrains, ``mass`` the column mass they are divided by to give
+    a wind, and ``tendency`` the storage term, all on (time, latitude,
+    longitude).  ``dry_air_mass_correction`` forms the integrals from the
+    fields and calls this; ``assembly.corrected_fields`` calls it with
+    integrals accumulated one analysis time at a time, since a month of
+    global three-dimensional fields does not fit in memory.  Returns
+    ``(du, dv)`` in m/s.
+    """
+    u_adj, v_adj = adjusted_col_fluxes(u_col, v_col, tendency, xr.zeros_like(tendency),
                                        lat_str=lat_str, lon_str=lon_str,
                                        time_str=time_str)
-    return (u_adj - u_col) / mass, (v_adj - v_col) / mass, mass
+    return (u_adj - u_col) / mass, (v_adj - v_col) / mass
 
 
 def polar_cap_transport(zonal_mean_source, lat_str=LAT_STR, radius=RAD_EARTH):

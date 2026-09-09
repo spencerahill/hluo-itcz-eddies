@@ -48,10 +48,11 @@ from collections.abc import Sequence
 
 import numpy as np
 import xarray as xr
+from xarray.coding.times import decode_cf_datetime
 
 from .names import LAT_STR, LEV_STR, LON_STR, TIME_STR
 
-__all__ = ["read_data", "read_forecast_data", "stride"]
+__all__ = ["read_data", "read_forecast_data", "read_meanflux_by_valid_time", "stride"]
 
 
 def stride(requested: float, builtin: float) -> int:
@@ -210,4 +211,67 @@ def read_forecast_data(
     logging.info("finished reading data")
     if lat_descending:
         out = out.reindex({LAT_STR: out[LAT_STR][::-1]})
+    return out
+
+
+def read_meanflux_by_valid_time(
+    paths: Sequence[str | pathlib.Path],
+    var: str,
+    spatial_resolution: float,
+    times: Sequence[np.datetime64],
+    lat_descending: bool = False,
+) -> xr.DataArray:
+    """An ERA5 mean-flux product at the given valid times, on a plain time axis.
+
+    Each stored value is the mean rate over the hour ending at its valid
+    time, ``forecast_initial_time + forecast_hour``.  The rate bracketing an
+    analysis hour ``t`` is the mean of the values valid at ``t`` and at
+    ``t + 1 h``: hours 6 and 7 of the run started six hours earlier for 00
+    and 12 UTC, and hour 12 of one run with hour 1 of the next for 06 and 18
+    UTC.  ``read_forecast_data`` rebuilds the time axis arithmetically the
+    way Haochang Luo's scripts did, which serves only the 00 and 12 UTC case;
+    this reader serves any analysis hour and reads only the requested slabs,
+    which is what ``scripts/assemble_fields.py`` needs for the net energy
+    input since 2026-09-09.
+
+    ``times`` are the valid times wanted, as ``datetime64``; every one must
+    be in the files, and the result is in their order.  The horizontal
+    subsampling is the stride of ``read_data`` taken on the stored grid,
+    which for ERA5 runs from the north pole.
+    """
+    wanted = np.asarray(times, dtype="datetime64[ns]")
+    found: dict[np.datetime64, np.ndarray] = {}
+    lat = lon = None
+    for path in paths:
+        with xr.open_dataset(path, decode_times=False) as ds:
+            init = ds["forecast_initial_time"]
+            units = init.attrs["units"]
+            if not units.startswith("hours"):
+                raise ValueError(f"forecast_initial_time in {path} is in {units!r}, not hours")
+            fh = ds["forecast_hour"].values
+            valid = decode_cf_datetime(
+                (init.values[:, None] + fh[None, :]).ravel(), units,
+                init.attrs.get("calendar", "standard"),
+            ).astype("datetime64[ns]").reshape(init.size, fh.size)
+            step = stride(spatial_resolution, float(ds[LON_STR][1] - ds[LON_STR][0]))
+            da = ds[var].isel({LAT_STR: slice(None, None, step),
+                               LON_STR: slice(None, None, step)})
+            if lat is None:
+                lat, lon = da[LAT_STR].values, da[LON_STR].values
+            for i, j in zip(*np.nonzero(np.isin(valid, wanted))):
+                t = valid[i, j]
+                if t not in found:
+                    found[t] = da.isel(forecast_initial_time=i, forecast_hour=j
+                                       ).transpose(LAT_STR, LON_STR).values
+    missing = [t for t in wanted if t not in found]
+    if missing:
+        raise ValueError(f"{var}: {len(missing)} of the {wanted.size} valid times wanted "
+                         f"are not in the files, the first {missing[0]}")
+    out = xr.DataArray(
+        np.stack([found[t] for t in wanted]), dims=(TIME_STR, LAT_STR, LON_STR),
+        coords={TIME_STR: wanted, LAT_STR: lat, LON_STR: lon}, name=var,
+    )
+    if bool(lat[0] > lat[-1]) != lat_descending:
+        out = out.isel({LAT_STR: slice(None, None, -1)})
+    logging.info("read %s at %d valid times", var, wanted.size)
     return out

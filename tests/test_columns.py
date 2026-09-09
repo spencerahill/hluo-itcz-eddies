@@ -247,3 +247,40 @@ def test_sfc_pressure_mask_matches_the_originals(
 def test_sfc_pressure_mask_rejects_a_field_with_no_level_coordinate(field, p_sfc):
     with pytest.raises(ValueError, match="level"):
         sfc_pressure_mask(field.isel(level=0, drop=True), p_sfc)
+
+
+# -------------------------------------------------- log-pressure interfaces
+
+
+def test_logp_interfaces_sum_to_surface_minus_top(grid, p_sfc):
+    """The clipping identity holds for log-pressure interfaces as well."""
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    dp = dp_from_sfc_pressure(level, p_sfc, interfaces="logp")
+    total = dp.sum("level") / 100.0
+    expected = p_sfc - float(np.min(grid["level"]))
+    np.testing.assert_allclose(total.values, np.broadcast_to(expected, total.shape),
+                               rtol=0, atol=1e-9)
+
+
+def test_logp_interfaces_sit_at_the_geometric_mean(grid):
+    """With the surface far below every level, the interior thicknesses are
+    differences of geometric means, and the geometric mean lies below the
+    arithmetic one in pressure, so the top layer is thinner and the bottom
+    layer thicker than under midpoint interfaces."""
+    level = np.sort(np.asarray(grid["level"], dtype="float64"))
+    lev = xr.DataArray(level, dims="level", coords={"level": level})
+    p_sfc = xr.DataArray(2000.0)
+    dp = dp_from_sfc_pressure(lev, p_sfc, interfaces="logp") / 100.0
+    mid = dp_from_sfc_pressure(lev, p_sfc) / 100.0
+    edges = np.sqrt(level[:-1] * level[1:])
+    np.testing.assert_allclose(dp.values[1:-1], edges[1:] - edges[:-1], atol=1e-9)
+    assert float(dp[0]) < float(mid[0])
+    assert float(dp[-1]) > float(mid[-1])
+
+
+def test_dp_rejects_an_unknown_interface_rule(grid, p_sfc):
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    with pytest.raises(ValueError):
+        dp_from_sfc_pressure(level, p_sfc, interfaces="cubic")

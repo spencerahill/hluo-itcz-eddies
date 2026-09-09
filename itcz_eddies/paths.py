@@ -49,6 +49,7 @@ __all__ = [
     "PL_VARS",
     "SFC_VARS",
     "MEANFLUX_VARS",
+    "VINTEG_VARS",
     "era5_root",
     "gpcp_root",
     "adjust_root",
@@ -60,10 +61,13 @@ __all__ = [
     "pl_file",
     "pl_files_month",
     "sfc_file",
+    "vinteg_file",
     "meanflux_files",
     "adjust_file",
     "mse_file",
     "fields_file",
+    "budget_file",
+    "fields_tag",
 ]
 
 
@@ -122,6 +126,7 @@ PL_VARS = {
 
 SFC_VARS = {
     "SP": ("128_134_sp", "ll025sc"),
+    "TCWV": ("128_137_tcwv", "ll025sc"),
 }
 
 # ERA5 forecast mean-flux variables.  The sign convention is ERA5's own:
@@ -136,6 +141,17 @@ MEANFLUX_VARS = {
     "MTNSWRF": ("235_039_mtnswrf", "ll025sc"),
     "MTNLWRF": ("235_040_mtnlwrf", "ll025sc"),
     "MTPR": ("235_055_mtpr", "ll025sc"),
+}
+
+# ERA5's hourly vertical integrals on its 137 model levels (table 162), the
+# reference the pipeline recommendation of 2026-09-09 measured the
+# pressure-level pipeline against.  162.62 plus 162.59 is the column energy
+# whose hourly tendency is the storage term of the budget (decision D3).
+VINTEG_VARS = {
+    "VIPILE": ("162_062_vipile", "ll025sc"),
+    "VIKE": ("162_059_vike", "ll025sc"),
+    "VIMAN": ("162_066_viman", "ll025sc"),
+    "VIWVN": ("162_072_viwvn", "ll025sc"),
 }
 
 
@@ -197,6 +213,17 @@ def sfc_file(var: str, year: int, month: int,
     return root / "e5.oper.an.sfc" / ym / name
 
 
+def vinteg_file(var: str, year: int, month: int,
+                root: pathlib.Path | None = None) -> pathlib.Path:
+    """Path to one monthly ERA5 file of hourly model-level vertical integrals."""
+    code, grid = VINTEG_VARS[var]
+    root = era5_root() if root is None else root
+    ym = f"{year}{month:02d}"
+    name = (f"e5.oper.an.vinteg.{code}.{grid}."
+            f"{ym}0100_{ym}{last_day(year, month):02d}23.nc")
+    return root / "e5.oper.an.vinteg" / ym / name
+
+
 def meanflux_files(var: str, year: int, month: int,
                    root: pathlib.Path | None = None,
                    pad_december: bool = True) -> list[pathlib.Path]:
@@ -254,8 +281,32 @@ def mse_file(year: int, month: int, day: int,
     return root / f"MSE_{ymd}00_{ymd}18.nc"
 
 
+def fields_tag(mode: str, temporal_resolution: float, interfaces: str = "logp") -> str:
+    """Subdirectory of the fields root that one assembly configuration writes to.
+
+    ``corrected_6h_logp`` is the pipeline of 2026-09-09.  The archived mode
+    applies no layer thickness of its own, so its tag carries no interface
+    rule.  The files of 2026-09-08, archived mode at twelve hours, sit at
+    the root itself, which the empty tag names.
+    """
+    hours = f"{temporal_resolution:g}h"
+    if mode == "archived":
+        return f"archived_{hours}"
+    return f"{mode}_{hours}_{interfaces}"
+
+
 def fields_file(year: int, month: int,
-                root: pathlib.Path | None = None) -> pathlib.Path:
-    """Path to one month of the assembled fields written by ``scripts/assemble_fields.py``."""
+                root: pathlib.Path | None = None, tag: str = "") -> pathlib.Path:
+    """Path to one month of the assembled fields written by ``scripts/assemble_fields.py``.
+
+    ``tag`` is the configuration subdirectory from ``fields_tag``; the empty
+    default names the root itself.
+    """
     root = fields_root() if root is None else root
-    return root / f"fields_{year}{month:02d}.nc"
+    return root / tag / f"fields_{year}{month:02d}.nc"
+
+
+def budget_file(year: int, month: int,
+                root: pathlib.Path | None = None, tag: str = "") -> pathlib.Path:
+    """Path to one month of the column budget diagnostics written beside the fields."""
+    return fields_file(year, month, root, tag).with_name(f"budget_{year}{month:02d}.nc")
