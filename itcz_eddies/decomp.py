@@ -44,9 +44,24 @@ weighting against 1.0e-3 without it.  Pass ``weights=dp`` to ``decompose`` to
 get it.  What changes is the definition of the stationary eddy, which becomes
 the departure from a mass-weighted rather than an arithmetic zonal mean.
 
+**The lower boundary moves, and a split of the wind cannot close under it.**
+F24 (2026-09-09) measured on ERA5 that the cross term :math:`[v'\bar h]`
+survives every time filter, at 0.14 to 0.19 PW rms over the tropics, and
+that 96 percent of it is the covariance of the transient wind with the
+fluctuating thickness of the lowest layer: the transient eddy mass flux of
+the surface layer times the MSE there.  The column integral makes the flux a
+product of three fluctuating factors, wind, MSE and layer mass, and a
+two-factor Reynolds split of wind and MSE leaves the third to a cross term
+whatever the filter.  ``decompose_mass_flux`` splits the layer mass flux
+``m = v dp / g`` and the MSE instead, so the layer mass is inside the
+quantity being split and the cross terms vanish for a projection time mean
+exactly as the algebra says.  It is the form the pipeline recommendation of
+2026-09-09 adopts (``pipeline-2026-09-09/`` in the manuscript repository).
+
 ``legacy_decompose`` reproduces the published calculation, difference by
 difference, so the current figures can be regenerated.  ``decompose`` computes
-the exact split.
+the exact split of the wind; ``decompose_mass_flux`` the split of the layer
+mass flux.
 """
 
 from __future__ import annotations
@@ -54,6 +69,7 @@ from __future__ import annotations
 import numpy as np
 import scipy.fft
 import xarray as xr
+from puffins.constants import GRAV_EARTH
 
 from .columns import nantrapz
 from .names import LEV_STR, LON_STR, TIME_STR
@@ -65,6 +81,7 @@ __all__ = [
     "ideal_time_mean",
     "zonal_mean",
     "decompose",
+    "decompose_mass_flux",
     "legacy_decompose",
     "barotropic_correction",
 ]
@@ -331,6 +348,130 @@ def decompose(v, mse, time_mean=boxcar_time_mean, lon_str=LON_STR,
     if zonal_mean_fields:
         out["v_bar_zm"] = v_bar_zm
         out["h_bar_zm"] = h_bar_zm
+    return out
+
+
+# ------------------------------------------- the split of the layer mass flux
+
+
+def decompose_mass_flux(v, mse, dp, time_mean=boxcar_time_mean, lon_str=LON_STR,
+                        zonal_mean_terms=True, zonal_mean_fields=False,
+                        grav=GRAV_EARTH, **kwargs):
+    r"""Split the meridional MSE flux into terms built from the layer mass flux.
+
+    The flux through a layer of thickness ``dp`` is :math:`m h`, with
+    :math:`m = v\,\delta p / g` the northward mass flux of the layer per unit
+    length (kg per meter per second) and :math:`h` the MSE.  Writing an
+    overbar for the time mean, a prime for the departure from it, square
+    brackets for the arithmetic zonal mean and :math:`[\cdot]_w` for the
+    zonal mean weighted by the time-mean layer thickness,
+
+    .. math::
+
+        [m h] = [\bar m][\bar h]_w + \bigl([\bar m \bar h] - [\bar m][\bar h]_w\bigr)
+                + [m'h'] + [\bar m h'] + [m' \bar h]
+
+    identically: mean circulation, stationary eddies, transient eddies and
+    two cross terms.  The column integral of each term is its sum over
+    levels, since the layer mass is inside :math:`m`, and it needs no
+    weighting of its own.  The five pointwise terms sum to :math:`m h` at
+    every gridpoint, and their zonal means sum to :math:`[m h]`, with no sixth
+    term: the longitude dependence of the layer thickness, which breaks the
+    five-term split of the wind (F15, F16), is inside :math:`m`.
+
+    Three properties, each checked in ``tests/test_mass_flux_split.py``.
+
+    The cross terms vanish in the mean over the record for a projection time
+    mean even when the surface pressure fluctuates, because the covariance of
+    the wind with the layer mass (F24) is inside :math:`m` and lands in the
+    transient term where it belongs.  For the split of the wind it does not,
+    whatever the filter.
+
+    The net mass transport of the mean-circulation term,
+    :math:`\sum_k [\bar m_k]`, equals the record mean of the zonal-mean
+    column mass transport of the wind for a projection time mean, so it is
+    whatever the wind's mass budget makes it: the physical vapor transport
+    after a mass correction, and nothing else.  No barotropic correction is
+    subtracted here; ``zonal_mean_fields`` returns what one needs.
+
+    With a layer thickness that does not vary in time or longitude, every
+    term equals the corresponding term of ``decompose`` times
+    :math:`\delta p / g`.
+
+    The mean-circulation term uses the mass-weighted zonal mean of the
+    time-mean MSE, so it depends on the MSE only where there is mass, never
+    on ERA5's extrapolated below-ground values.  The stationary term is
+    defined as the remainder :math:`[\bar m \bar h] - [\bar m][\bar h]_w`,
+    which equals :math:`[\bar m^* \bar h^*] + [\bar m][\bar h^*]` with the
+    stars taken against those two means; the second piece is zero at levels
+    no terrain cuts, and the remainder form keeps the below-ground MSE out of
+    the split entirely.
+
+    Parameters
+    ----------
+    v
+        Meridional wind, mass-corrected or not; the term sizes say which.
+    mse
+        Moist static energy on the same grid.
+    dp
+        Layer thickness in Pa from ``columns.dp_from_sfc_pressure``, zero
+        below ground and clipped at the surface, on the same grid as ``v``.
+    time_mean
+        Callable applied to ``m``, to ``mse`` and to ``dp``.
+    zonal_mean_terms
+        Whether to return zonal-mean terms or the pointwise ones.
+    zonal_mean_fields
+        When ``True`` the returned Dataset also carries ``m_bar_zm``,
+        ``h_bar_zm`` and ``dp_bar_zm`` on (time, level, latitude), from which
+        the net mass transport of the mean circulation and the column-mean
+        MSE it would be assigned can be formed offline.
+    grav
+        Gravity, in ``m = v dp / grav``.
+    **kwargs
+        Passed through to ``time_mean``.
+
+    Returns
+    -------
+    xarray.Dataset with ``mmc``, ``stationary``, ``transient``,
+    ``cross_mean_wind_eddy_mse`` (:math:`\bar m h'`),
+    ``cross_eddy_wind_mean_mse`` (:math:`m' \bar h`) and ``total``
+    (:math:`m h`), each in W per meter per level.
+    """
+    m = v * dp / grav
+    m_bar = time_mean(m, **kwargs)
+    h_bar = time_mean(mse, **kwargs)
+    w = time_mean(dp, **kwargs)
+    m_prime = m - m_bar
+    h_prime = mse - h_bar
+
+    m_bar_zm = m_bar.mean(lon_str, skipna=False)
+    w_sum = w.sum(lon_str, skipna=False)
+    h_bar_zm = (h_bar * w).sum(lon_str, skipna=False) / w_sum.where(w_sum != 0)
+    mmc = m_bar_zm * h_bar_zm
+
+    terms = {
+        "mmc": mmc,
+        "stationary": m_bar * h_bar - mmc,
+        "transient": m_prime * h_prime,
+        "cross_mean_wind_eddy_mse": m_bar * h_prime,
+        "cross_eddy_wind_mean_mse": m_prime * h_bar,
+        "total": m * mse,
+    }
+    if zonal_mean_terms:
+        out = xr.Dataset(
+            {name: (arr if lon_str not in arr.dims
+                    else arr.mean(lon_str, skipna=False))
+             for name, arr in terms.items()}
+        )
+    else:
+        out = xr.Dataset(
+            {name: arr.broadcast_like(terms["total"])
+             for name, arr in terms.items()}
+        )
+    if zonal_mean_fields:
+        out["m_bar_zm"] = m_bar_zm
+        out["h_bar_zm"] = h_bar_zm
+        out["dp_bar_zm"] = w.mean(lon_str, skipna=False)
     return out
 
 

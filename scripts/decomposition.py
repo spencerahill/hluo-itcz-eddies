@@ -98,6 +98,7 @@ from itcz_eddies.decomp import (
     block_time_mean,
     boxcar_time_mean,
     decompose,
+    decompose_mass_flux,
     ideal_time_mean,
     lanczos_time_mean,
     legacy_decompose,
@@ -126,6 +127,7 @@ FIVE_TERMS = ["mmc", "stationary", "transient",
               "cross_mean_wind_eddy_mse", "cross_eddy_wind_mean_mse"]
 SIX_TERMS = FIVE_TERMS + ["zonal_cross"]
 ZONAL_MEAN_FIELDS = ["v_bar_zm", "h_bar_zm"]
+MASS_FLUX_ZONAL_MEAN_FIELDS = ["m_bar_zm", "h_bar_zm", "dp_bar_zm"]
 
 
 def parse_args(argv=None):
@@ -149,6 +151,13 @@ def parse_args(argv=None):
     parser.add_argument("--zonal-mean", choices=["plain", "mass-weighted"],
                         default="plain",
                         help="how longitudes are weighted in the zonal mean")
+    parser.add_argument("--split", choices=["wind", "mass-flux"], default="wind",
+                        help="split the wind and the MSE (five zonal-mean terms plus "
+                             "the sixth pointwise term), or the layer mass flux "
+                             "v dp/g and the MSE (five terms, exact under a moving "
+                             "surface; the pipeline recommendation of 2026-09-09). "
+                             "The mass-flux split carries its own zonal-mean "
+                             "weighting and ignores --zonal-mean and --quadrature")
     parser.add_argument("--lat-band", type=int, default=10,
                         help="latitudes per band in the exact split")
     parser.add_argument("--out", type=pathlib.Path, default=None,
@@ -166,6 +175,8 @@ def config_tag(args):
     """A directory name that says which configuration produced the files."""
     barotropic = "withB" if args.barotropic_correction else "noB"
     weighting = "massZM" if args.zonal_mean == "mass-weighted" else "plainZM"
+    if args.split == "mass-flux":
+        weighting = "mflux"
     time_mean = args.time_mean
     if time_mean == "lanczos":
         time_mean = f"lanczos{args.lanczos_cutoff_days:g}d{args.lanczos_lobes}"
@@ -315,36 +326,53 @@ def exact_split_by_band(v, mse, p_sfc, args):
         hb = mse.isel(latitude=sl).astype("float64")
         pb = p_sfc.isel(latitude=sl).astype("float64")
         dp = dp_from_sfc_pressure(vb["level"], pb).transpose(*vb.dims)
-        if args.zonal_mean == "mass-weighted":
-            weights = dp
-        else:
-            # The published skipna mean: every point above ground counts once.
-            weights = xr.where(dp > 0, 1.0, 0.0)
-
-        terms = decompose(vb, hb, time_mean=TIME_MEANS[args.time_mean],
-                          zonal_mean_terms=False, weights=weights,
-                          zonal_mean_fields=True, **kwargs)
-        zm = terms[ZONAL_MEAN_FIELDS]
-        zm["dp_zm"] = dp.mean("longitude")
-        terms = terms.drop_vars(ZONAL_MEAN_FIELDS)
-        del vb, hb
-
-        if args.quadrature == "mass":
-            reduced = xr.Dataset({name: col_int(terms[name], dp)
+        if args.split == "mass-flux":
+            # The split of the layer mass flux: the column integral is the
+            # sum over levels, since dp/g is inside every term, and five
+            # terms are exact with no sixth.
+            terms = decompose_mass_flux(vb, hb, dp,
+                                        time_mean=TIME_MEANS[args.time_mean],
+                                        zonal_mean_terms=False,
+                                        zonal_mean_fields=True, **kwargs)
+            zm = terms[MASS_FLUX_ZONAL_MEAN_FIELDS]
+            terms = terms.drop_vars(MASS_FLUX_ZONAL_MEAN_FIELDS)
+            del vb, hb
+            reduced = xr.Dataset({name: terms[name].sum("level", skipna=False)
                                   for name in terms.data_vars})
+            check_terms = FIVE_TERMS
+            del terms, dp
         else:
-            mask = xr.where(terms["total"]["level"] <= pb, 1.0, np.nan
-                            ).transpose(*terms["total"].dims)
-            reduced = xr.Dataset({name: col_int_trapz(terms[name], mask)
-                                  for name in terms.data_vars})
-        del terms, dp, weights
+            if args.zonal_mean == "mass-weighted":
+                weights = dp
+            else:
+                # The published skipna mean: every point above ground counts once.
+                weights = xr.where(dp > 0, 1.0, 0.0)
+
+            terms = decompose(vb, hb, time_mean=TIME_MEANS[args.time_mean],
+                              zonal_mean_terms=False, weights=weights,
+                              zonal_mean_fields=True, **kwargs)
+            zm = terms[ZONAL_MEAN_FIELDS]
+            zm["dp_zm"] = dp.mean("longitude")
+            terms = terms.drop_vars(ZONAL_MEAN_FIELDS)
+            del vb, hb
+
+            if args.quadrature == "mass":
+                reduced = xr.Dataset({name: col_int(terms[name], dp)
+                                      for name in terms.data_vars})
+            else:
+                mask = xr.where(terms["total"]["level"] <= pb, 1.0, np.nan
+                                ).transpose(*terms["total"].dims)
+                reduced = xr.Dataset({name: col_int_trapz(terms[name], mask)
+                                      for name in terms.data_vars})
+            check_terms = SIX_TERMS
+            del terms, dp, weights
         gc.collect()
 
-        # The six pointwise terms sum to the total at every gridpoint, and the
+        # The pointwise terms sum to the total at every gridpoint, and the
         # column integral is linear, so the same holds for the maps.  Anything
         # beyond rounding here is a defect in the split, not in the physics.
         finite = reduced["total"].notnull()
-        six = sum(reduced[name] for name in SIX_TERMS)
+        six = sum(reduced[name] for name in check_terms)
         scale = float(abs(reduced["total"]).where(finite).max())
         gap = float(abs(six - reduced["total"]).where(finite).max()) / scale
         worst_gap = max(worst_gap, gap)
@@ -446,6 +474,7 @@ def main(argv=None):
         "flank_months": args.flank_months,
         "barotropic_correction": str(args.barotropic_correction),
         "zonal_mean": args.zonal_mean,
+        "split": args.split,
         "lat_band": args.lat_band,
         "input_source": source,
         "boundary": " ".join(str(b) for b in args.boundary),
@@ -474,13 +503,19 @@ def main(argv=None):
         out = out_dir / f"zonal_mean_fields_{args.year}.nc"
         if out.exists():
             out.unlink()
-        zonal_mean_fields["v_bar_zm"].attrs.update(
-            long_name="zonal mean of the time-mean meridional wind", units="m s-1")
-        zonal_mean_fields["h_bar_zm"].attrs.update(
-            long_name="zonal mean of the time-mean moist static energy",
-            units="J kg-1")
-        zonal_mean_fields["dp_zm"].attrs.update(
-            long_name="arithmetic zonal mean of the layer thickness", units="Pa")
+        long_names = {
+            "v_bar_zm": ("zonal mean of the time-mean meridional wind", "m s-1"),
+            "m_bar_zm": ("arithmetic zonal mean of the time-mean layer mass flux v dp/g",
+                         "kg m-1 s-1"),
+            "h_bar_zm": ("zonal mean of the time-mean moist static energy, weighted by "
+                         "the time-mean layer thickness in the mass-flux split",
+                         "J kg-1"),
+            "dp_zm": ("arithmetic zonal mean of the layer thickness", "Pa"),
+            "dp_bar_zm": ("arithmetic zonal mean of the time-mean layer thickness", "Pa"),
+        }
+        for name in zonal_mean_fields.data_vars:
+            long_name, units = long_names[name]
+            zonal_mean_fields[name].attrs.update(long_name=long_name, units=units)
         zonal_mean_fields.assign_attrs(
             description=("the zonal-mean time-mean fields the mean-circulation "
                          "term is the product of, with the zonal-mean layer "
