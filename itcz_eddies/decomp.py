@@ -52,6 +52,7 @@ the exact split.
 from __future__ import annotations
 
 import numpy as np
+import scipy.fft
 import xarray as xr
 
 from .columns import nantrapz
@@ -61,6 +62,7 @@ __all__ = [
     "boxcar_time_mean",
     "block_time_mean",
     "lanczos_time_mean",
+    "ideal_time_mean",
     "zonal_mean",
     "decompose",
     "legacy_decompose",
@@ -165,6 +167,49 @@ def lanczos_time_mean(arr, temporal_resolution=12, cutoff_days=30, lobes=60,
         "window"
     )
     return rolled.dot(weights)
+
+
+def ideal_time_mean(arr, temporal_resolution=12, cutoff_days=30,
+                    time_str=TIME_STR):
+    """Ideal spectral low-pass in time: the Fourier coefficients above the
+    cutoff frequency set to zero, everything below kept unchanged.
+
+    The transfer function is exactly one or exactly zero at every frequency,
+    so the operator is a projection: applying it twice gives what applying
+    it once gave, and by the spectral identity in
+    ``code-review/time-mean-operator.pdf`` (its equation for the cross terms
+    as an integral of the cross-spectrum weighted by K(1-K)) both cross terms
+    of the exact split vanish in the mean over the filtered record.  The
+    Lanczos of ``lanczos_time_mean`` is a windowed approximation of this
+    filter.
+
+    Two properties to keep in mind.  The transform treats the record as
+    periodic, so the ends of the record wrap onto each other, and a
+    calculation that drops flanking months at each end should read enough
+    of them to keep the wraparound out of the kept year.  And a sharp cutoff
+    rings: a step in the data produces oscillations at the cutoff period on
+    either side of it, which the Lanczos window is designed to suppress.
+    Neither property produces NaN, so unlike the Lanczos every time step
+    comes back with a value.
+
+    The Nyquist coefficient, when the record length is even, sits at a
+    period of two samples and is always removed for any cutoff longer than
+    that.
+    """
+    axis = arr.get_axis_num(time_str)
+    n_times = arr.sizes[time_str]
+    step_days = temporal_resolution / 24.0
+    freqs = scipy.fft.rfftfreq(n_times, d=step_days)      # cycles per day
+    keep = freqs <= 1.0 / cutoff_days
+
+    def _filter(values):
+        spectrum = scipy.fft.rfft(values, axis=axis)
+        shape = [1] * spectrum.ndim
+        shape[axis] = keep.size
+        spectrum = spectrum * keep.reshape(shape)
+        return scipy.fft.irfft(spectrum, n=n_times, axis=axis)
+
+    return arr.copy(data=_filter(np.asarray(arr.values, dtype="float64")))
 
 
 # ---------------------------------------------------------- the exact split

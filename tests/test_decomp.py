@@ -18,6 +18,7 @@ from itcz_eddies.decomp import (
     block_time_mean,
     boxcar_time_mean,
     decompose,
+    ideal_time_mean,
     lanczos_time_mean,
     legacy_decompose,
     zonal_mean,
@@ -61,7 +62,8 @@ def _relative_gap(terms, names):
 
 
 @pytest.mark.parametrize(
-    "time_mean", [boxcar_time_mean, block_time_mean, lanczos_time_mean]
+    "time_mean", [boxcar_time_mean, block_time_mean, lanczos_time_mean,
+                  ideal_time_mean]
 )
 def test_the_six_pointwise_terms_sum_to_the_flux(wind_and_mse, time_mean):
     """At every gridpoint, for any time-mean operator."""
@@ -71,7 +73,8 @@ def test_the_six_pointwise_terms_sum_to_the_flux(wind_and_mse, time_mean):
 
 
 @pytest.mark.parametrize(
-    "time_mean", [boxcar_time_mean, block_time_mean, lanczos_time_mean]
+    "time_mean", [boxcar_time_mean, block_time_mean, lanczos_time_mean,
+                  ideal_time_mean]
 )
 def test_the_five_zonal_mean_terms_sum_to_the_zonal_mean_flux(wind_and_mse, time_mean):
     """After the zonal mean, the sixth term vanishes and five suffice."""
@@ -105,6 +108,63 @@ def test_the_cross_terms_vanish_in_the_time_mean_for_a_block_average(wind_and_ms
 
     three = terms["mmc"] + terms["stationary"] + terms["transient"]
     assert float(abs(block_time_mean(three - terms["total"])).max()) < 1e-12 * scale
+
+
+def test_the_ideal_low_pass_is_a_projection_and_annihilates_the_cross_terms(
+    wind_and_mse
+):
+    """The spectral low-pass applied twice is the low-pass applied once, and
+    the two cross terms of the exact split vanish in the mean over the
+    record.
+
+    The Lanczos, for comparison, is only nearly a projection: on the same
+    field its second application moves the result by more than the rounding
+    floor, and its record-mean cross terms are nonzero.  Both halves are
+    asserted so the contrast is measured rather than described.
+    """
+    v, mse = wind_and_mse
+    once = ideal_time_mean(v)
+    twice = ideal_time_mean(once)
+    scale = float(abs(once).max())
+    assert float(abs(twice - once).max()) < 1e-12 * scale
+
+    terms = decompose(v, mse, time_mean=ideal_time_mean)
+    flux_scale = float(abs(terms["total"]).max())
+    for name in ["cross_mean_wind_eddy_mse", "cross_eddy_wind_mean_mse"]:
+        record_mean = float(abs(terms[name].mean("time")).max())
+        assert record_mean < 1e-12 * flux_scale, name
+
+    # A 41-weight Lanczos, so that two applications leave 160 of the 240
+    # time steps defined; the default 121 weights would leave none.
+    lanczos_once = lanczos_time_mean(v, lobes=20)
+    lanczos_twice = lanczos_time_mean(lanczos_once, lobes=20).dropna("time")
+    assert lanczos_twice.sizes["time"] == 160
+    moved = float(abs(lanczos_twice - lanczos_once.sel(time=lanczos_twice["time"])).max())
+    assert moved > 1e-6 * scale
+    lanczos_terms = decompose(v, mse, time_mean=lanczos_time_mean,
+                              lobes=20).dropna("time")
+    lanczos_cross = max(
+        float(abs(lanczos_terms[name].mean("time")).max())
+        for name in ["cross_mean_wind_eddy_mse", "cross_eddy_wind_mean_mse"])
+    assert lanczos_cross > 1e-6 * flux_scale
+
+
+def test_the_ideal_low_pass_keeps_a_slow_wave_and_removes_a_fast_one(grid):
+    """A 90-day wave passes untouched and a 6-day wave is removed entirely.
+
+    The time axis is 12-hourly over 360 days, so both periods are whole
+    numbers of cycles in the record and neither sits at the cutoff.
+    """
+    time = xr.DataArray(np.arange(720.0), dims="time",
+                        coords={"time": np.arange(720.0)})
+    lat = xr.DataArray(grid["latitude"], dims="latitude",
+                       coords={"latitude": grid["latitude"]})
+    slow = np.cos(2 * np.pi * time / (2 * 90.0)) * (1.0 + lat / 100.0)
+    fast = np.sin(2 * np.pi * time / (2 * 6.0)) * (2.0 - lat / 100.0)
+    field = (slow + fast).transpose("time", "latitude")
+    filtered = ideal_time_mean(field, temporal_resolution=12, cutoff_days=30)
+    xr.testing.assert_allclose(filtered, slow.transpose("time", "latitude"),
+                               atol=1e-10)
 
 
 def test_a_planted_decomposition_is_recovered():

@@ -18,7 +18,13 @@ three are open decisions at the top of ``code-review/FINDINGS.md``:
 ``--time-mean``
     ``boxcar`` is the published 30-day centred rolling mean, ``block`` a
     non-overlapping 30-day average, ``lanczos`` a low-pass whose cutoff and
-    window are ``--lanczos-cutoff-days`` and ``--lanczos-lobes``.
+    window are ``--lanczos-cutoff-days`` and ``--lanczos-lobes``, and
+    ``ideal`` the spectral low-pass at the same cutoff, which is an exact
+    projection and treats the record as periodic.  ``--flank-months`` sets how
+    many months either side of the year are read to feed the time mean and
+    then dropped: one covers a 121-weight Lanczos, whose undefined half-window
+    is 30 days; a 241-weight window needs 60 days, so three months, since two
+    give only 59 days after December.
 ``--barotropic-correction``
     Whether to subtract the column mean of the zonal-mean wind from the
     mean-circulation term alone, which the published code does.
@@ -92,6 +98,7 @@ from itcz_eddies.decomp import (
     block_time_mean,
     boxcar_time_mean,
     decompose,
+    ideal_time_mean,
     lanczos_time_mean,
     legacy_decompose,
 )
@@ -102,6 +109,7 @@ TIME_MEANS = {
     "boxcar": boxcar_time_mean,
     "block": block_time_mean,
     "lanczos": lanczos_time_mean,
+    "ideal": ideal_time_mean,
 }
 
 TERM_LONG_NAMES = {
@@ -128,7 +136,11 @@ def parse_args(argv=None):
     parser.add_argument("--time-mean", choices=sorted(TIME_MEANS),
                         default="boxcar")
     parser.add_argument("--lanczos-cutoff-days", type=float, default=30.0,
-                        help="Lanczos low-pass cutoff period (decision 3)")
+                        help="low-pass cutoff period for lanczos and ideal "
+                             "(decision 3)")
+    parser.add_argument("--flank-months", type=int, default=1,
+                        help="months read either side of the year for the "
+                             "time mean, then dropped")
     parser.add_argument("--lanczos-lobes", type=int, default=60,
                         help="half-width of the Lanczos window in time steps; "
                              "the window has 2*lobes+1 weights (decision 3)")
@@ -157,6 +169,8 @@ def config_tag(args):
     time_mean = args.time_mean
     if time_mean == "lanczos":
         time_mean = f"lanczos{args.lanczos_cutoff_days:g}d{args.lanczos_lobes}"
+    elif time_mean == "ideal":
+        time_mean = f"ideal{args.lanczos_cutoff_days:g}d"
     return f"{args.quadrature}_{time_mean}_{barotropic}_{weighting}"
 
 
@@ -166,19 +180,23 @@ def time_mean_kwargs(args):
     if args.time_mean == "lanczos":
         kwargs.update(cutoff_days=args.lanczos_cutoff_days,
                       lobes=args.lanczos_lobes)
+    elif args.time_mean == "ideal":
+        kwargs.update(cutoff_days=args.lanczos_cutoff_days)
     return kwargs
 
 
-def months_of(year):
-    """Every (year, month) the calculation needs, including the two flanks.
+def months_of(year, flank_months=1):
+    """Every (year, month) the calculation needs, including the flanks.
 
     The time mean reaches into the months either side of the record, so
-    December of the preceding year and January of the following one are read
-    and then dropped from the output.
+    ``flank_months`` months before January and after December are read and
+    then dropped from the output.
     """
-    return ([paths.shift_month(year, 1, -1)]
+    return ([paths.shift_month(year, 1, -k)
+             for k in range(flank_months, 0, -1)]
             + [(year, month) for month in range(1, 13)]
-            + [paths.shift_month(year, 12, 1)])
+            + [paths.shift_month(year, 12, k)
+               for k in range(1, flank_months + 1)])
 
 
 def read_year_from_era5(args):
@@ -190,7 +208,7 @@ def read_year_from_era5(args):
 
     pl_files = {var: [] for var in ("T", "Q", "Z", "V")}
     sfc_files, adjust_files = [], []
-    for year, month in months_of(args.year):
+    for year, month in months_of(args.year, args.flank_months):
         for var in pl_files:
             pl_files[var].extend(paths.pl_files_month(var, year, month))
         sfc = paths.sfc_file("SP", year, month)
@@ -242,7 +260,7 @@ def fields_files(args):
     following January has ERA5 fields and no adjustment file.
     """
     files = []
-    for year, month in months_of(args.year):
+    for year, month in months_of(args.year, args.flank_months):
         path = paths.fields_file(year, month)
         if path.exists():
             files.append(path)
@@ -425,6 +443,7 @@ def main(argv=None):
         "time_mean": args.time_mean,
         "lanczos_cutoff_days": args.lanczos_cutoff_days,
         "lanczos_lobes": args.lanczos_lobes,
+        "flank_months": args.flank_months,
         "barotropic_correction": str(args.barotropic_correction),
         "zonal_mean": args.zonal_mean,
         "lat_band": args.lat_band,
