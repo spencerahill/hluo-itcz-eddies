@@ -171,7 +171,8 @@ def lanczos_time_mean(arr, temporal_resolution=12, cutoff_days=30, lobes=60,
 
 
 def decompose(v, mse, time_mean=boxcar_time_mean, lon_str=LON_STR,
-              zonal_mean_terms=True, weights=None, **kwargs):
+              zonal_mean_terms=True, weights=None, zonal_mean_fields=False,
+              **kwargs):
     r"""Split the meridional MSE flux into its exact terms.
 
     With ``zonal_mean_terms=True``, the default, every term is a zonal mean and the
@@ -217,6 +218,15 @@ def decompose(v, mse, time_mean=boxcar_time_mean, lon_str=LON_STR,
         every zonal mean here is weighted by them.  That is what makes the
         five-term form close under a column integral taken to each longitude's
         own surface pressure; see the module docstring.
+    zonal_mean_fields
+        When ``True`` the returned Dataset also carries ``v_bar_zm`` and
+        ``h_bar_zm``, the zonal means of the time-mean wind and MSE that the
+        ``mmc`` term is the product of, on their own ``(time, level,
+        latitude)`` dimensions.  They are what a barotropic correction of
+        the mean-circulation term needs: the column mean of ``v_bar_zm``
+        times ``h_bar_zm``, integrated over the column, is the MSE flux of
+        the zonal-mean wind's net mass transport, which decision 1 in
+        ``code-review/FINDINGS.md`` is about.
     **kwargs
         Passed through to ``time_mean``.
 
@@ -262,15 +272,21 @@ def decompose(v, mse, time_mean=boxcar_time_mean, lon_str=LON_STR,
         "total": v * mse,
     }
     if zonal_mean_terms:
-        return xr.Dataset(
+        out = xr.Dataset(
             {name: (arr if lon_str not in arr.dims
                     else zonal_mean(arr, weights=weights, lon_str=lon_str))
              for name, arr in terms.items()}
         )
-    terms["zonal_cross"] = v_bar_zm * h_bar_star + v_bar_star * h_bar_zm
-    return xr.Dataset(
-        {name: arr.broadcast_like(terms["total"]) for name, arr in terms.items()}
-    )
+    else:
+        terms["zonal_cross"] = v_bar_zm * h_bar_star + v_bar_star * h_bar_zm
+        out = xr.Dataset(
+            {name: arr.broadcast_like(terms["total"])
+             for name, arr in terms.items()}
+        )
+    if zonal_mean_fields:
+        out["v_bar_zm"] = v_bar_zm
+        out["h_bar_zm"] = h_bar_zm
+    return out
 
 
 # --------------------------------------------------------- the legacy split

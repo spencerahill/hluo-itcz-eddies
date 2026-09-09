@@ -17,22 +17,51 @@ three are open decisions at the top of ``code-review/FINDINGS.md``:
     mass-weighted sum stays within 0.13% and varies smoothly.
 ``--time-mean``
     ``boxcar`` is the published 30-day centred rolling mean, ``block`` a
-    non-overlapping 30-day average, ``lanczos`` a low-pass at the same cutoff.
+    non-overlapping 30-day average, ``lanczos`` a low-pass whose cutoff and
+    window are ``--lanczos-cutoff-days`` and ``--lanczos-lobes``.
 ``--barotropic-correction``
     Whether to subtract the column mean of the zonal-mean wind from the
     mean-circulation term alone, which the published code does.
 ``--zonal-mean``
-    ``plain`` is the arithmetic average around a latitude circle, which the
-    published code uses.  ``mass-weighted`` weights each longitude by that
-    level's layer thickness.  Measured in
-    ``code-review/checks/zonal_mean_weighting.py``, the weighted form closes
-    the five-term split to 7.0e-16 of the peak under a column integral taken
-    to each longitude's own surface pressure, where the plain form leaves
-    1.0e-3.  It also redefines the stationary eddy as the departure from a
-    mass-weighted zonal mean.
+    ``plain`` is the arithmetic average around a latitude circle over the
+    points above ground, which is the published code's ``skipna`` mean.
+    ``mass-weighted`` weights each longitude by that level's layer thickness.
+    Measured in ``code-review/checks/zonal_mean_weighting.py``, the weighted
+    form closes the five-term split to 7.0e-16 of the peak under a column
+    integral taken to each longitude's own surface pressure, where the plain
+    form leaves 1.0e-3.  It also redefines the stationary eddy as the
+    departure from a mass-weighted zonal mean.
+
+A caution that the flags cannot enforce.  The archived adjustment files under
+``ITCZ_ADJUST_ROOT`` were derived from a budget integrated with the trapezoid
+rule, and four fifths of what they add is the flux of the surface layer that
+rule drops (F22 in ``code-review/FINDINGS.md``).  Under ``--quadrature mass``
+that layer is kept, so the adjusted total counts it twice: in July 1997 the
+adjusted zonal-mean total comes out northward at 5S where the physical
+transport is southward.  The terms still sum to the total, and the effect of
+the zonal-mean weighting on the split is measured correctly, but the total
+itself is not the flux the manuscript needs until the adjustment is rebuilt
+on the mass-weighted quadrature.
+
+Where the input comes from.  If ``scripts/assemble_fields.py`` has written
+``fields_YYYYMM.nc`` under ``ITCZ_FIELDS_ROOT`` for the year and its two
+flanking months, those are read; otherwise the daily ERA5 files are read
+directly, which is about 1,700 files for one year.
+
+How the exact split is computed.  The fields for the year plus flanks are
+loaded once as float32, and the split runs in float64 over bands of
+``--lat-band`` latitudes, since every operation in it (the time mean, the
+zonal mean, the column integral) acts within a latitude.  A band of ten
+latitudes on the 60S to 60N half-degree grid is about 1.8 GB per float64
+field, and the whole run stays under about 100 GB.
 
 Every output file carries the full configuration in its attributes and in its
-directory name, so two configurations cannot overwrite one another.
+directory name, so two configurations cannot overwrite one another.  Besides
+the column-integrated maps of each term, the exact split writes
+``zonal_mean_fields_YYYY.nc``, holding the zonal means of the time-mean wind
+and MSE and the zonal-mean layer thickness on (time, level, latitude), from
+which any barotropic correction of the mean-circulation term can be formed
+without rerunning.
 
 Usage:
   python scripts/decomposition.py --year 1997
@@ -47,6 +76,7 @@ import datetime
 import gc
 import logging
 import pathlib
+import time as _time
 
 import numpy as np
 import xarray as xr
@@ -80,8 +110,14 @@ TERM_LONG_NAMES = {
     "transient": "transient eddies",
     "cross_mean_wind_eddy_mse": "time-mean wind times eddy MSE",
     "cross_eddy_wind_mean_mse": "eddy wind times time-mean MSE",
+    "zonal_cross": "zonal-mean field times zonal departure, zero in a plain zonal mean",
     "total": "full flux",
 }
+
+FIVE_TERMS = ["mmc", "stationary", "transient",
+              "cross_mean_wind_eddy_mse", "cross_eddy_wind_mean_mse"]
+SIX_TERMS = FIVE_TERMS + ["zonal_cross"]
+ZONAL_MEAN_FIELDS = ["v_bar_zm", "h_bar_zm"]
 
 
 def parse_args(argv=None):
@@ -91,11 +127,18 @@ def parse_args(argv=None):
                         default="mass")
     parser.add_argument("--time-mean", choices=sorted(TIME_MEANS),
                         default="boxcar")
+    parser.add_argument("--lanczos-cutoff-days", type=float, default=30.0,
+                        help="Lanczos low-pass cutoff period (decision 3)")
+    parser.add_argument("--lanczos-lobes", type=int, default=60,
+                        help="half-width of the Lanczos window in time steps; "
+                             "the window has 2*lobes+1 weights (decision 3)")
     parser.add_argument("--barotropic-correction", action="store_true",
                         help="reproduce the published treatment of the MMC wind")
     parser.add_argument("--zonal-mean", choices=["plain", "mass-weighted"],
                         default="plain",
                         help="how longitudes are weighted in the zonal mean")
+    parser.add_argument("--lat-band", type=int, default=10,
+                        help="latitudes per band in the exact split")
     parser.add_argument("--out", type=pathlib.Path, default=None,
                         help="output directory; default is $ITCZ_PRODUCT_ROOT "
                              "plus a subdirectory naming the configuration")
@@ -111,13 +154,25 @@ def config_tag(args):
     """A directory name that says which configuration produced the files."""
     barotropic = "withB" if args.barotropic_correction else "noB"
     weighting = "massZM" if args.zonal_mean == "mass-weighted" else "plainZM"
-    return f"{args.quadrature}_{args.time_mean}_{barotropic}_{weighting}"
+    time_mean = args.time_mean
+    if time_mean == "lanczos":
+        time_mean = f"lanczos{args.lanczos_cutoff_days:g}d{args.lanczos_lobes}"
+    return f"{args.quadrature}_{time_mean}_{barotropic}_{weighting}"
+
+
+def time_mean_kwargs(args):
+    """Keyword arguments the chosen time mean takes, for ``decompose``."""
+    kwargs = {"temporal_resolution": args.temporal_resolution}
+    if args.time_mean == "lanczos":
+        kwargs.update(cutoff_days=args.lanczos_cutoff_days,
+                      lobes=args.lanczos_lobes)
+    return kwargs
 
 
 def months_of(year):
     """Every (year, month) the calculation needs, including the two flanks.
 
-    The centred 30-day time mean reaches 15 days either side of the record, so
+    The time mean reaches into the months either side of the record, so
     December of the preceding year and January of the following one are read
     and then dropped from the output.
     """
@@ -126,8 +181,8 @@ def months_of(year):
             + [paths.shift_month(year, 12, 1)])
 
 
-def read_year(args):
-    """Assemble v, MSE and surface pressure for one year plus its flanks."""
+def read_year_from_era5(args):
+    """Assemble v, MSE and surface pressure for one year plus its flanks, lazily."""
     boundary = args.boundary
     read = dict(temporal_resolution=args.temporal_resolution,
                 spatial_resolution=args.spatial_resolution,
@@ -179,13 +234,136 @@ def read_year(args):
     return v, mse, p_sfc
 
 
-def reduce_terms(terms, args, p_sfc, mask):
-    """Column-integrate every term with the chosen quadrature."""
+def fields_files(args):
+    """The assembled monthly files for the year and its flanks, or ``None``.
+
+    The twelve months of the year must all exist; a missing flank is logged
+    and skipped, which is the situation at the end of the record, where the
+    following January has ERA5 fields and no adjustment file.
+    """
+    files = []
+    for year, month in months_of(args.year):
+        path = paths.fields_file(year, month)
+        if path.exists():
+            files.append(path)
+        elif year == args.year:
+            return None
+        else:
+            logging.warning("flank month %d-%02d has no assembled fields file "
+                            "%s; the time mean will be one-sided there",
+                            year, month, path)
+    return files
+
+
+def read_year_from_fields(args, files):
+    """v, MSE and surface pressure from the assembled monthly files, lazily."""
+    logging.info("reading %d assembled fields files from %s", len(files),
+                 files[0].parent)
+    ds = xr.open_mfdataset(files, concat_dim="time", combine="nested")
+    lat0, lat1, lon0, lon1 = args.boundary
+    ds = ds.sel(latitude=slice(min(lat0, lat1), max(lat0, lat1)),
+                longitude=slice(min(lon0, lon1), max(lon0, lon1)))
+    return ds["v_adj"], ds["mse"], ds["p_sfc"]
+
+
+def read_year(args):
+    files = fields_files(args)
+    if files is None:
+        logging.info("no assembled fields for %d under %s; reading ERA5 directly",
+                     args.year, paths.fields_root())
+        return read_year_from_era5(args), "era5"
+    return read_year_from_fields(args, files), "fields"
+
+
+# ------------------------------------------------------- the exact split
+
+
+def exact_split_by_band(v, mse, p_sfc, args):
+    """Run ``decompose`` band by band in latitude, in float64, in memory.
+
+    Returns the column-integrated maps of the six pointwise terms and the
+    total, and the zonal-mean fields the mean-circulation term is built
+    from, both concatenated over latitude.
+    """
+    n_lat = v.sizes["latitude"]
+    band = args.lat_band
+    kwargs = time_mean_kwargs(args)
+    reduced_bands, zm_bands = [], []
+    worst_gap = 0.0
+    for i0 in range(0, n_lat, band):
+        started = _time.monotonic()
+        sl = slice(i0, min(i0 + band, n_lat))
+        vb = v.isel(latitude=sl).astype("float64")
+        hb = mse.isel(latitude=sl).astype("float64")
+        pb = p_sfc.isel(latitude=sl).astype("float64")
+        dp = dp_from_sfc_pressure(vb["level"], pb).transpose(*vb.dims)
+        if args.zonal_mean == "mass-weighted":
+            weights = dp
+        else:
+            # The published skipna mean: every point above ground counts once.
+            weights = xr.where(dp > 0, 1.0, 0.0)
+
+        terms = decompose(vb, hb, time_mean=TIME_MEANS[args.time_mean],
+                          zonal_mean_terms=False, weights=weights,
+                          zonal_mean_fields=True, **kwargs)
+        zm = terms[ZONAL_MEAN_FIELDS]
+        zm["dp_zm"] = dp.mean("longitude")
+        terms = terms.drop_vars(ZONAL_MEAN_FIELDS)
+        del vb, hb
+
+        if args.quadrature == "mass":
+            reduced = xr.Dataset({name: col_int(terms[name], dp)
+                                  for name in terms.data_vars})
+        else:
+            mask = xr.where(terms["total"]["level"] <= pb, 1.0, np.nan
+                            ).transpose(*terms["total"].dims)
+            reduced = xr.Dataset({name: col_int_trapz(terms[name], mask)
+                                  for name in terms.data_vars})
+        del terms, dp, weights
+        gc.collect()
+
+        # The six pointwise terms sum to the total at every gridpoint, and the
+        # column integral is linear, so the same holds for the maps.  Anything
+        # beyond rounding here is a defect in the split, not in the physics.
+        finite = reduced["total"].notnull()
+        six = sum(reduced[name] for name in SIX_TERMS)
+        scale = float(abs(reduced["total"]).where(finite).max())
+        gap = float(abs(six - reduced["total"]).where(finite).max()) / scale
+        worst_gap = max(worst_gap, gap)
+        logging.info("band %3d:%3d  latitudes %6.1f to %6.1f  six-term gap "
+                     "%.1e of the band peak  %.0f s", sl.start, sl.stop,
+                     float(v["latitude"][sl.start]),
+                     float(v["latitude"][sl.stop - 1]), gap,
+                     _time.monotonic() - started)
+        reduced_bands.append(reduced)
+        zm_bands.append(zm)
+    logging.info("worst six-term gap over all bands: %.1e of the band peak",
+                 worst_gap)
+    return (xr.concat(reduced_bands, "latitude"),
+            xr.concat(zm_bands, "latitude"),
+            worst_gap)
+
+
+# ------------------------------------------------------- the legacy split
+
+
+def legacy_split(v, mse, p_sfc, args):
+    """The published calculation, lazily on the whole domain, as before."""
+    mask = sfc_pressure_mask(mse, p_sfc,
+                             below_ground=np.nan if args.quadrature == "trapezoid"
+                             else 0.0)
+    terms = legacy_decompose(v, mse, mask, p_sfc,
+                             temporal_resolution=args.temporal_resolution)
+    terms["total"] = xr.where(mask == 1, v, np.nan) * xr.where(
+        mask == 1, mse, np.nan)
     level = terms["total"]["level"]
     if args.quadrature == "mass":
         dp = dp_from_sfc_pressure(level, p_sfc)
         return xr.Dataset({name: col_int(terms[name], dp) for name in terms})
     return xr.Dataset({name: col_int_trapz(terms[name], mask) for name in terms})
+
+
+# ---------------------------------------------------------------- driver
 
 
 def main(argv=None):
@@ -205,32 +383,39 @@ def main(argv=None):
             "which uses the 30-day centred rolling mean; it cannot be combined "
             f"with --time-mean {args.time_mean}"
         )
+    if args.barotropic_correction and args.quadrature != "trapezoid":
+        raise SystemExit(
+            "--barotropic-correction reproduces the published calculation, "
+            "which masks below-ground points to NaN and integrates with the "
+            "trapezoid rule; under the mass-weighted quadrature the layer that "
+            "straddles the surface is NaN and the column integral is undefined"
+        )
 
-    v, mse, p_sfc = read_year(args)
-    mask = sfc_pressure_mask(mse, p_sfc,
-                             below_ground=np.nan if args.quadrature == "trapezoid"
-                             else 0.0)
-
+    (v, mse, p_sfc), source = read_year(args)
+    zonal_mean_fields = None
+    worst_gap = None
     if args.barotropic_correction:
-        terms = legacy_decompose(v, mse, mask, p_sfc,
-                                 temporal_resolution=args.temporal_resolution)
-        terms["total"] = xr.where(mask == 1, v, np.nan) * xr.where(
-            mask == 1, mse, np.nan)
+        reduced = legacy_split(v, mse, p_sfc, args)
     else:
-        weights = None
-        if args.zonal_mean == "mass-weighted":
-            weights = dp_from_sfc_pressure(mse["level"], p_sfc)
-        terms = decompose(v, mse, time_mean=TIME_MEANS[args.time_mean],
-                          zonal_mean_terms=False, weights=weights,
-                          temporal_resolution=args.temporal_resolution)
-
-    reduced = reduce_terms(terms, args, p_sfc, mask)
-    del terms
-    gc.collect()
+        started = _time.monotonic()
+        logging.info("loading the fields into memory as float32: %s",
+                     dict(v.sizes))
+        v = v.astype("float32").load()
+        mse = mse.astype("float32").load()
+        p_sfc = p_sfc.astype("float32").load()
+        gc.collect()
+        logging.info("loaded in %.0f s", _time.monotonic() - started)
+        reduced, zonal_mean_fields, worst_gap = exact_split_by_band(
+            v, mse, p_sfc, args)
+        del v, mse
+        gc.collect()
 
     # Drop the flanking months that only existed to fill the time-mean window.
     in_year = reduced["time"].dt.year == args.year
     reduced = reduced.isel(time=in_year)
+    if zonal_mean_fields is not None:
+        zonal_mean_fields = zonal_mean_fields.isel(
+            time=zonal_mean_fields["time"].dt.year == args.year)
 
     out_dir = args.out or (paths.product_root() / config_tag(args))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -238,14 +423,20 @@ def main(argv=None):
         "year": args.year,
         "quadrature": args.quadrature,
         "time_mean": args.time_mean,
+        "lanczos_cutoff_days": args.lanczos_cutoff_days,
+        "lanczos_lobes": args.lanczos_lobes,
         "barotropic_correction": str(args.barotropic_correction),
         "zonal_mean": args.zonal_mean,
+        "lat_band": args.lat_band,
+        "input_source": source,
         "boundary": " ".join(str(b) for b in args.boundary),
         "temporal_resolution_hours": args.temporal_resolution,
         "spatial_resolution_degrees": args.spatial_resolution,
         "written": datetime.datetime.now().astimezone().isoformat(
             timespec="seconds"),
     }
+    if worst_gap is not None:
+        run_config["six_term_gap_relative_to_band_peak"] = worst_gap
 
     for name in reduced.data_vars:
         out = out_dir / f"vMSE_col_{name}_{args.year}.nc"
@@ -258,6 +449,25 @@ def main(argv=None):
             **run_config,
         )
         ds.to_netcdf(out)
+        logging.info("wrote %s", out)
+
+    if zonal_mean_fields is not None:
+        out = out_dir / f"zonal_mean_fields_{args.year}.nc"
+        if out.exists():
+            out.unlink()
+        zonal_mean_fields["v_bar_zm"].attrs.update(
+            long_name="zonal mean of the time-mean meridional wind", units="m s-1")
+        zonal_mean_fields["h_bar_zm"].attrs.update(
+            long_name="zonal mean of the time-mean moist static energy",
+            units="J kg-1")
+        zonal_mean_fields["dp_zm"].attrs.update(
+            long_name="arithmetic zonal mean of the layer thickness", units="Pa")
+        zonal_mean_fields.assign_attrs(
+            description=("the zonal-mean time-mean fields the mean-circulation "
+                         "term is the product of, with the zonal-mean layer "
+                         "thickness; the zonal means use the run's weighting"),
+            **run_config,
+        ).to_netcdf(out)
         logging.info("wrote %s", out)
 
 

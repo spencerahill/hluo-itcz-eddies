@@ -97,6 +97,39 @@ def test_column_integral_of_a_constant(grid, p_sfc):
     xr.testing.assert_allclose(col_int(ones, dp), expected, rtol=1e-12)
 
 
+def test_column_integral_ignores_nan_below_ground_and_propagates_it_above(
+    grid, p_sfc, field
+):
+    """A NaN under the surface contributes nothing; one above it poisons the column.
+
+    ``int_dp_g`` sums with NaN skipped, which would turn a column that is NaN
+    at every level, such as the ends of a Lanczos-filtered record, into a
+    flux of zero.  Below-ground NaN, which the legacy masking produces, must
+    still be harmless.
+    """
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    dp = dp_from_sfc_pressure(level, p_sfc)
+    reference = col_int(field, dp)
+
+    below_ground = (dp == 0).transpose(*field.dims)
+    assert bool(below_ground.any()), "the ridge must put some levels below ground"
+    poisoned_below = field.where(~below_ground)
+    xr.testing.assert_allclose(col_int(poisoned_below, dp), reference, rtol=1e-14)
+
+    poisoned_above = field.copy()
+    # The topmost level is above ground everywhere; NaN it at one gridpoint
+    # and at every level of one whole time step.
+    poisoned_above[0, 0, 3, 2] = np.nan
+    poisoned_above[1, :, :, :] = np.nan
+    out = col_int(poisoned_above, dp)
+    assert np.isnan(float(out[0, 3, 2]))
+    assert bool(out.isel(time=1).isnull().all())
+    kept = out.notnull()
+    assert int(kept.sum()) == int(reference.size - reference.isel(time=1).size - 1)
+    xr.testing.assert_allclose(out.where(kept), reference.where(kept), rtol=1e-14)
+
+
 # ------------------------------------------------- linearity and commutation
 
 

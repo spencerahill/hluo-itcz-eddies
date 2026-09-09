@@ -13,18 +13,28 @@
 # and would have cost 828 on Casper.
 #
 # Usage:
-#   qsub -v SCRIPT=decomposition.py \
+#   qsub -v SCRIPT=decomposition.py,CONDA_ENV=/glade/work/spencerhill/conda-envs/itcz-eddies-pkg \
 #        -A UPRI0023 -q casper -J 1997-2023:1 \
 #        -l walltime=12:00:00 -l select=1:ncpus=1:mem=64GB \
 #        jobs/submit.sh
 #
+# PBS_ARRAY_INDEX, when there is one, becomes --year.  Anything else the
+# script needs goes in ARGS and is appended verbatim, so one month is
+#   qsub -v SCRIPT=assemble_fields.py,ARGS="--year 1997 --month 7",CONDA_ENV=... jobs/submit.sh
+#
+# CONDA_ENV may be a name or a prefix.  On Casper the name itcz-eddies resolves
+# to an environment created in November 2022, so pass the prefix of the one
+# built from this repository's environment.yml.
+#
 # Environment the job needs, set here rather than hardcoded in the Python:
-#   ITCZ_ERA5_ROOT, ITCZ_ADJUST_ROOT, ITCZ_MSE_ROOT, ITCZ_PRODUCT_ROOT
+#   ITCZ_ERA5_ROOT, ITCZ_ADJUST_ROOT, ITCZ_MSE_ROOT, ITCZ_FIELDS_ROOT,
+#   ITCZ_PRODUCT_ROOT
 # See itcz_eddies/paths.py for the defaults.
 
 #PBS -N itcz-eddies
 #PBS -j oe
 #PBS -m ae
+#PBS -M shill1@ccny.cuny.edu
 
 set -euo pipefail
 
@@ -43,8 +53,11 @@ echo "date          $(date -Is)"
 echo "repo          ${REPO}"
 echo "script        ${SCRIPT}"
 echo "year          ${YEAR:-<none>}"
+echo "args          ${ARGS:-<none>}"
 echo "ERA5 root     ${ITCZ_ERA5_ROOT:-<default>}"
+echo "fields root   ${ITCZ_FIELDS_ROOT:-<default>}"
 echo "product root  ${ITCZ_PRODUCT_ROOT:-<default>}"
+echo "git           $(git -C "${REPO}" rev-parse --short HEAD) $(git -C "${REPO}" rev-parse --abbrev-ref HEAD)"
 
 cd "${REPO}"
-python -W ignore "scripts/${SCRIPT}" ${YEAR:+--year "${YEAR}"}
+python -u -W ignore "scripts/${SCRIPT}" ${YEAR:+--year "${YEAR}"} ${ARGS:-}

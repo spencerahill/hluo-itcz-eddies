@@ -40,6 +40,22 @@ pytest
 installed the same way from its own checkout. `windspharm` needs a Fortran
 compiler and comes from conda-forge rather than pip.
 
+## Running a year
+
+Two entry points. `scripts/assemble_fields.py` reads one month of ERA5 and
+the archived mass adjustment and writes the adjusted wind, the MSE and the
+surface pressure to one file under `ITCZ_FIELDS_ROOT`; the fourteen months a
+year needs (the year plus a flank on each side for the time mean) run as
+independent jobs. `scripts/decomposition.py` then reads those files, or the
+daily ERA5 files directly when they are absent, and writes the
+column-integrated flux terms under `ITCZ_PRODUCT_ROOT` in a directory named
+for the configuration. `jobs/submit.sh` is the PBS template for both:
+
+```
+qsub -v "SCRIPT=assemble_fields.py,ARGS=--year 1997 --month 7,CONDA_ENV=<prefix>" jobs/submit.sh
+qsub -v "SCRIPT=decomposition.py,YEAR=1997,ARGS=--quadrature mass --time-mean lanczos --zonal-mean mass-weighted,CONDA_ENV=<prefix>" jobs/submit.sh
+```
+
 ## Where the data lives
 
 The original scripts carry absolute `/glade` paths as string literals inside

@@ -234,9 +234,19 @@ def col_int(arr, dp, lev_str=LEV_STR, grav=GRAV_EARTH):
     to zero wherever the layer thickness is zero.  Without that step a field
     carrying NaN below ground would poison the sum, since ``0 * nan`` is
     ``nan``; with it, a below-ground value of any kind contributes nothing.
+
+    A NaN in a layer of nonzero thickness is a different matter: it means the
+    field is undefined somewhere the column mass is not, and the integral is
+    then undefined too.  ``int_dp_g`` sums with NaN skipped, so left alone it
+    would return the integral over the remaining layers, and for a column
+    that is NaN throughout, zero.  Found 2026-09-08 when the Lanczos time
+    mean, which is NaN for its half-window at each end of the record, came
+    out of the column integral as a flux of exactly zero there.  Such a
+    column is returned as NaN.
     """
+    undefined = (arr.isnull() & (dp > 0)).any(lev_str)
     arr = xr.where(dp > 0, arr, 0.0)
-    return int_dp_g(arr, dp, dim=lev_str, grav=grav)
+    return int_dp_g(arr, dp, dim=lev_str, grav=grav).where(~undefined)
 
 
 def col_avg(arr, dp, lev_str=LEV_STR):

@@ -26,9 +26,17 @@ Environment variables, all optional:
 ``ITCZ_MSE_ROOT``
     Directory holding the 4-D ``MSE_*.nc`` files.  Default
     ``/glade/derecho/scratch/hcluo/MSE``.
+``ITCZ_FIELDS_ROOT``
+    Directory holding the monthly ``fields_YYYYMM.nc`` files that
+    ``scripts/assemble_fields.py`` writes: the mass-adjusted meridional wind,
+    the MSE and the surface pressure on the analysis grid, so that a yearly
+    calculation reads 14 contiguous files instead of 1,700 daily ERA5 ones.
+    Default ``/glade/derecho/scratch/spencerhill/itcz-fields``.
 ``ITCZ_PRODUCT_ROOT``
     Directory the decomposition products are written under.  Default
-    ``/glade/derecho/scratch/hcluo``.
+    ``/glade/work/spencerhill/itcz-products``.  Until 2026-09-08 the default
+    was Haochang Luo's own scratch directory, which a run without ``--out``
+    would have tried to write into.
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ __all__ = [
     "gpcp_root",
     "adjust_root",
     "mse_root",
+    "fields_root",
     "product_root",
     "shift_month",
     "last_day",
@@ -54,6 +63,7 @@ __all__ = [
     "meanflux_files",
     "adjust_file",
     "mse_file",
+    "fields_file",
 ]
 
 
@@ -61,7 +71,8 @@ _DEFAULT_ERA5_ROOT = "/glade/campaign/collections/rda/data/d633000"
 _DEFAULT_GPCP_ROOT = "/glade/campaign/collections/rda/data/d728007"
 _DEFAULT_ADJUST_ROOT = "/glade/work/hcluo/data/MSE_adjust"
 _DEFAULT_MSE_ROOT = "/glade/derecho/scratch/hcluo/MSE"
-_DEFAULT_PRODUCT_ROOT = "/glade/derecho/scratch/hcluo"
+_DEFAULT_FIELDS_ROOT = "/glade/derecho/scratch/spencerhill/itcz-fields"
+_DEFAULT_PRODUCT_ROOT = "/glade/work/spencerhill/itcz-products"
 
 
 def _root(env_var: str, default: str) -> pathlib.Path:
@@ -86,6 +97,11 @@ def adjust_root() -> pathlib.Path:
 def mse_root() -> pathlib.Path:
     """Directory of the 4-D ``MSE_*.nc`` files, from ``ITCZ_MSE_ROOT``."""
     return _root("ITCZ_MSE_ROOT", _DEFAULT_MSE_ROOT)
+
+
+def fields_root() -> pathlib.Path:
+    """Directory of the monthly ``fields_YYYYMM.nc`` files, from ``ITCZ_FIELDS_ROOT``."""
+    return _root("ITCZ_FIELDS_ROOT", _DEFAULT_FIELDS_ROOT)
 
 
 def product_root() -> pathlib.Path:
@@ -236,3 +252,10 @@ def mse_file(year: int, month: int, day: int,
     root = mse_root() if root is None else root
     ymd = f"{year}{month:02d}{day:02d}"
     return root / f"MSE_{ymd}00_{ymd}18.nc"
+
+
+def fields_file(year: int, month: int,
+                root: pathlib.Path | None = None) -> pathlib.Path:
+    """Path to one month of the assembled fields written by ``scripts/assemble_fields.py``."""
+    root = fields_root() if root is None else root
+    return root / f"fields_{year}{month:02d}.nc"

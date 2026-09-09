@@ -356,3 +356,63 @@ def test_zonal_mean_helper_reduces_to_the_arithmetic_mean(wind_and_mse):
     plain = zonal_mean(v)
     uniform = zonal_mean(v, weights=xr.ones_like(v))
     xr.testing.assert_allclose(plain, uniform, rtol=1e-14)
+
+
+def test_indicator_weights_reproduce_the_published_skipna_mean(
+    grid, wind_and_mse, p_sfc
+):
+    """Weighting by the above-ground indicator is the published zonal mean.
+
+    The published code masks below-ground points to NaN and averages with
+    ``skipna=True``, so every above-ground point counts once and the
+    denominator is the number of them.  A weighted mean with weights of one
+    above ground and zero below is the same number, without a NaN entering
+    the calculation.  This is how ``scripts/decomposition.py`` realizes
+    ``--zonal-mean plain`` in the exact split.
+    """
+    v, _ = wind_and_mse
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    p_sfc_time_mean = p_sfc.isel(time=0, drop=True)
+    above = (level <= p_sfc_time_mean).transpose("level", "latitude", "longitude")
+    assert 0.0 < float(above.mean()) < 1.0, "the ridge must put some points below ground"
+
+    published = v.where(above).mean("longitude", skipna=True)
+    indicator = zonal_mean(v, weights=xr.where(above, 1.0, 0.0))
+    xr.testing.assert_allclose(indicator, published, rtol=1e-13)
+
+
+def test_zonal_mean_fields_are_the_weighted_means_of_the_time_means(
+    grid, wind_and_mse, p_sfc
+):
+    """``zonal_mean_fields=True`` returns the factors of the MMC term.
+
+    Checked in both output forms and under both weightings: the returned
+    fields are the weighted zonal means of the time-mean wind and MSE, their
+    product is the ``mmc`` term, and the other terms are unchanged.
+    """
+    v, mse = wind_and_mse
+    level = xr.DataArray(grid["level"], dims="level",
+                         coords={"level": grid["level"]})
+    dp = dp_from_sfc_pressure(level, p_sfc.isel(time=0, drop=True))
+    for weights in (None, dp):
+        for zonal_mean_terms in (True, False):
+            without = decompose(v, mse, zonal_mean_terms=zonal_mean_terms,
+                                weights=weights)
+            with_fields = decompose(v, mse, zonal_mean_terms=zonal_mean_terms,
+                                    weights=weights, zonal_mean_fields=True)
+            assert set(with_fields.data_vars) == (
+                set(without.data_vars) | {"v_bar_zm", "h_bar_zm"})
+            for name in without.data_vars:
+                assert np.array_equal(with_fields[name].values,
+                                      without[name].values, equal_nan=True), name
+            v_bar_zm = zonal_mean(boxcar_time_mean(v), weights=weights)
+            h_bar_zm = zonal_mean(boxcar_time_mean(mse), weights=weights)
+            xr.testing.assert_equal(with_fields["v_bar_zm"], v_bar_zm)
+            xr.testing.assert_equal(with_fields["h_bar_zm"], h_bar_zm)
+            assert "longitude" not in with_fields["v_bar_zm"].dims
+            product = (with_fields["v_bar_zm"] * with_fields["h_bar_zm"])
+            xr.testing.assert_allclose(
+                product.broadcast_like(with_fields["mmc"]).transpose(
+                    *with_fields["mmc"].dims),
+                with_fields["mmc"], rtol=1e-14)
