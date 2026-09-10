@@ -89,6 +89,11 @@ DEFAULT_HOURS = {"corrected": 6.0, "archived": 12.0}
 FLUX_ARGS = {"MSSHF": "sensible", "MSLHF": "latent", "MSNSWRF": "sfc_sw",
              "MSNLWRF": "sfc_lw", "MTNSWRF": "toa_sw", "MTNLWRF": "toa_lw"}
 HOUR = np.timedelta64(1, "h")
+# storage chunks of the three-dimensional fields: a band of LAT_CHUNK
+# latitudes, which scripts/decomposition.py reads one at a time, in blocks
+# of TIME_CHUNK samples (33 MB of float32 at four samples a day)
+LAT_CHUNK = 10
+TIME_CHUNK = 31
 
 
 def parse_args(argv=None):
@@ -221,7 +226,19 @@ def write(ds, dest):
     # the readers downstream select latitude bands with ascending slices
     if ds["latitude"][0] > ds["latitude"][-1]:
         ds = ds.isel(latitude=slice(None, None, -1))
-    ds.to_netcdf(dest)
+    # The decomposition streams the year one band of LAT_CHUNK latitudes at
+    # a time, so the three-dimensional fields are stored in chunks of that
+    # many latitudes: from a contiguous file a band is 4,588 pieces of 29 KB
+    # per month and variable, which read at 8 MB/s on GLADE (job 5882929,
+    # 2026-09-09, 24 s of CPU in ten minutes), where a chunk is one read.
+    encoding = {}
+    for name, var in ds.data_vars.items():
+        if var.ndim == 4:
+            shape = dict(zip(var.dims, var.shape))
+            encoding[name] = {"chunksizes": (min(TIME_CHUNK, shape["time"]), shape["level"],
+                                             min(LAT_CHUNK, shape["latitude"]),
+                                             shape["longitude"])}
+    ds.to_netcdf(dest, encoding=encoding)
     logging.info("wrote %s: %s", dest, dict(ds.sizes))
 
 
