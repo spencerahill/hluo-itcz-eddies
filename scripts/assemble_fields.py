@@ -228,9 +228,12 @@ def write(ds, dest):
         ds = ds.isel(latitude=slice(None, None, -1))
     # The decomposition streams the year one band of LAT_CHUNK latitudes at
     # a time, so the three-dimensional fields are stored in chunks of that
-    # many latitudes: from a contiguous file a band is 4,588 pieces of 29 KB
-    # per month and variable, which read at 8 MB/s on GLADE (job 5882929,
-    # 2026-09-09, 24 s of CPU in ten minutes), where a chunk is one read.
+    # many latitudes, and a band is four whole-chunk reads per month and
+    # variable.  From a contiguous file it is 4,588 pieces of 29 KB, which
+    # read at 8 MB/s in the decomposition of 2026-09-09 (job 5882929, 24 s
+    # of CPU in ten minutes) while eighteen assembly jobs were writing to
+    # the same file system, and at 300 MB/s on an idle login node
+    # afterwards, so the chunking guards against the contended case.
     encoding = {}
     for name, var in ds.data_vars.items():
         if var.ndim == 4:
