@@ -141,6 +141,7 @@ MEANFLUX_VARS = {
     "MTNSWRF": ("235_039_mtnswrf", "ll025sc"),
     "MTNLWRF": ("235_040_mtnlwrf", "ll025sc"),
     "MTPR": ("235_055_mtpr", "ll025sc"),
+    "MER": ("235_043_mer", "ll025sc"),
 }
 
 # ERA5's hourly vertical integrals on its 137 model levels (table 162), the
