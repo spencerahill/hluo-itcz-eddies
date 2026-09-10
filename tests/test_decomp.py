@@ -521,17 +521,25 @@ def _lanczos_response(weights, period_days, temporal_resolution):
     return float((weights * np.exp(-2j * np.pi * freq * n)).real.sum())
 
 
-@pytest.mark.parametrize("temporal_resolution,lobes", [(6.0, 240), (12.0, 120)])
-def test_the_lanczos_low_pass_has_its_designed_response(temporal_resolution, lobes):
-    """The two windows the pipeline uses keep the long periods, halve the
-    cutoff and reject the short periods.
+@pytest.mark.parametrize("temporal_resolution,lobes,cutoff_days", [
+    (6.0, 240, 30.0),    # the pipeline: 481 weights at four samples a day
+    (12.0, 120, 30.0),   # the same 120-day window at two samples a day
+    (6.0, 240, 15.0),
+    (6.0, 240, 10.0),
+])
+def test_the_lanczos_low_pass_has_its_designed_response(
+        temporal_resolution, lobes, cutoff_days):
+    """The filter keeps the long periods, halves the cutoff and rejects the
+    short periods.
 
-    Both are the 60-day half window of decision D4 at their own sampling: 481
-    weights at four samples a day, 241 at two.  The bounds here are properties
-    of a windowed ideal low-pass and hold for any cutoff, so they survive a
-    change of the cutoff itself.
+    The first two cases are the 60-day half window of decision D4 at their own
+    sampling.  The other two are shorter cutoffs in the same window, which is
+    what makes this a test of the design rather than of one configuration.
+    A LONGER cutoff in this window does not pass, and
+    ``test_the_lanczos_window_and_the_cutoff_are_coupled`` is why.
     """
-    weights = lanczos_weights(30.0, temporal_resolution=temporal_resolution, lobes=lobes)
+    weights = lanczos_weights(cutoff_days, temporal_resolution=temporal_resolution,
+                              lobes=lobes)
     assert weights.size == 2 * lobes + 1
     np.testing.assert_allclose(weights.sum(), 1.0, rtol=1e-12, atol=0.0)
 
@@ -539,13 +547,13 @@ def test_the_lanczos_low_pass_has_its_designed_response(temporal_resolution, lob
         return _lanczos_response(weights, period_days, temporal_resolution)
 
     # passband: periods at or above twice the cutoff come through, to 0.01
-    for period in (60.0, 120.0, 240.0):
-        assert abs(response(period) - 1.0) < 0.01, period
-    # the cutoff itself is halved, which is what "30-day cutoff" means
-    assert abs(response(30.0) - 0.5) < 0.01
+    for multiple in (2.0, 4.0, 8.0):
+        assert abs(response(multiple * cutoff_days) - 1.0) < 0.01, multiple
+    # the cutoff itself is halved, which is what naming a cutoff means
+    assert abs(response(cutoff_days) - 0.5) < 0.01
     # stopband: periods at or below three quarters of the cutoff are gone
-    for period in (22.5, 15.0, 7.5, 2.0):
-        assert abs(response(period)) < 0.01, period
+    for multiple in (0.75, 0.5, 0.25, 0.0667):
+        assert abs(response(multiple * cutoff_days)) < 0.01, multiple
 
 
 def test_the_lanczos_response_is_set_by_the_window_in_days_not_the_sampling():
@@ -563,3 +571,40 @@ def test_the_lanczos_response_is_set_by_the_window_in_days_not_the_sampling():
             # the stopband, so the tolerance is absolute: the two weight
             # arrays differ only in their floating-point path.
             rtol=0.0, atol=1e-7, err_msg=f"period {period} d")
+
+
+def test_the_lanczos_window_and_the_cutoff_are_coupled():
+    """The window has to be about four cutoff periods long, so ``--lanczos-lobes``
+    cannot stay put when ``--lanczos-cutoff-days`` moves.
+
+    The quantity below is the response at three quarters of the cutoff period,
+    one definite frequency inside the transition, and not a maximum over the
+    whole stopband: just below the cutoff the response is still near a half,
+    for any window, because that is what a transition is.
+
+    Measured at four samples a day with a 30-day cutoff: 0.1495 when the window
+    is two cutoff periods long, 0.0486 at three, and 0.0008 at four.  The
+    pipeline sits at four, its 481 weights spanning 120 days against a 30-day
+    cutoff, so it has no headroom for a longer cutoff: keeping this window and
+    moving the cutoff to 45 days puts 0.0771 of a 34-day signal into what the
+    split calls the time mean.
+
+    A longer window also costs flank months, since the filter returns NaN over
+    ``lobes`` samples at each end of the record.
+    """
+    res = 6.0
+    cutoff = 30.0
+    leak = {}
+    for ratio in (2.0, 3.0, 4.0):
+        lobes = int(round(ratio * cutoff * 24.0 / res / 2))
+        weights = lanczos_weights(cutoff, temporal_resolution=res, lobes=lobes)
+        leak[ratio] = abs(_lanczos_response(weights, 0.75 * cutoff, res))
+    assert leak[2.0] > 0.10
+    assert 0.02 < leak[3.0] < 0.10
+    assert leak[4.0] < 0.01
+    # the shipped window is the four-cutoff one
+    shipped = lanczos_weights(30.0, temporal_resolution=6.0, lobes=240)
+    assert abs((shipped.size * 6.0 / 24.0) / 30.0 - 4.0) < 0.05
+    # and stretching the cutoff inside it degrades the split
+    stretched = lanczos_weights(45.0, temporal_resolution=6.0, lobes=240)
+    assert abs(_lanczos_response(stretched, 0.75 * 45.0, 6.0)) > 0.05
