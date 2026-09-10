@@ -53,7 +53,13 @@ for ym in "${months[@]}"; do
     year=${ym%-*}
     month=$((10#${ym#*-}))
     tag=$(printf '%d%02d' "$year" "$month")
-    log="$LOGS/assemble-${tag}$( [ -n "$extra" ] && echo "-extra" ).log"
+    # extra arguments name the log, so a smoke and a full month never share one;
+    # a test inside a command substitution would trip set -e when it fails
+    suffix=""
+    if [ -n "$extra" ]; then
+        suffix=$(printf '%s' "$extra" | tr -d ' -')
+    fi
+    log="$LOGS/assemble-${tag}${suffix:+-$suffix}.log"
     rm -f "$log"
     id=$(qsub -N "assemble-$tag" \
          -v "SCRIPT=assemble_fields.py,ARGS=--year $year --month $month$extra,CONDA_ENV=$CONDA_ENV,REPO=$REPO,ITCZ_FIELDS_ROOT=$FIELDS_ROOT,ITCZ_PRODUCT_ROOT=$PRODUCT_ROOT" \
