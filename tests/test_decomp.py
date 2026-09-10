@@ -20,6 +20,7 @@ from itcz_eddies.decomp import (
     decompose,
     ideal_time_mean,
     lanczos_time_mean,
+    lanczos_weights,
     legacy_decompose,
     zonal_mean,
 )
@@ -512,3 +513,53 @@ def test_the_fft_lanczos_matches_the_rolling_dot_product():
     fft_t = lanczos_time_mean(transposed, lobes=20)
     np.testing.assert_allclose(fft_t.transpose("time", "level", "latitude").values[20:-20],
                                lanczos_time_mean(arr, lobes=20).values[20:-20], rtol=0, atol=1e-12)
+def _lanczos_response(weights, period_days, temporal_resolution):
+    """Amplitude the weights retain at a sinusoid of the given period."""
+    lobes = (weights.size - 1) // 2
+    n = np.arange(-lobes, lobes + 1)
+    freq = 1.0 / (period_days * 24.0 / temporal_resolution)  # cycles per sample
+    return float((weights * np.exp(-2j * np.pi * freq * n)).real.sum())
+
+
+@pytest.mark.parametrize("temporal_resolution,lobes", [(6.0, 240), (12.0, 120)])
+def test_the_lanczos_low_pass_has_its_designed_response(temporal_resolution, lobes):
+    """The two windows the pipeline uses keep the long periods, halve the
+    cutoff and reject the short periods.
+
+    Both are the 60-day half window of decision D4 at their own sampling: 481
+    weights at four samples a day, 241 at two.  The bounds here are properties
+    of a windowed ideal low-pass and hold for any cutoff, so they survive a
+    change of the cutoff itself.
+    """
+    weights = lanczos_weights(30.0, temporal_resolution=temporal_resolution, lobes=lobes)
+    assert weights.size == 2 * lobes + 1
+    np.testing.assert_allclose(weights.sum(), 1.0, rtol=1e-12, atol=0.0)
+
+    def response(period_days):
+        return _lanczos_response(weights, period_days, temporal_resolution)
+
+    # passband: periods at or above twice the cutoff come through, to 0.01
+    for period in (60.0, 120.0, 240.0):
+        assert abs(response(period) - 1.0) < 0.01, period
+    # the cutoff itself is halved, which is what "30-day cutoff" means
+    assert abs(response(30.0) - 0.5) < 0.01
+    # stopband: periods at or below three quarters of the cutoff are gone
+    for period in (22.5, 15.0, 7.5, 2.0):
+        assert abs(response(period)) < 0.01, period
+
+
+def test_the_lanczos_response_is_set_by_the_window_in_days_not_the_sampling():
+    """The 481-weight window at four samples a day and the 241-weight window
+    at two are the same 120-day window, so they have the same response at
+    every physical period.  A units error in the sampling would break this
+    and nothing else in the suite would see it."""
+    six_hourly = lanczos_weights(30.0, temporal_resolution=6.0, lobes=240)
+    twelve_hourly = lanczos_weights(30.0, temporal_resolution=12.0, lobes=120)
+    for period in (240.0, 120.0, 60.0, 40.0, 30.0, 22.5, 15.0, 7.5):
+        np.testing.assert_allclose(
+            _lanczos_response(six_hourly, period, 6.0),
+            _lanczos_response(twelve_hourly, period, 12.0),
+            # the response is an O(1) amplitude and passes through zero in
+            # the stopband, so the tolerance is absolute: the two weight
+            # arrays differ only in their floating-point path.
+            rtol=0.0, atol=1e-7, err_msg=f"period {period} d")

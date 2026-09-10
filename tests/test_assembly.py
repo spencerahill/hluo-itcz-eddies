@@ -14,7 +14,7 @@ from itcz_eddies.assembly import (
     corrected_fields,
 )
 from itcz_eddies.columns import col_int, dp_from_sfc_pressure
-from itcz_eddies.mass import RAD_EARTH
+from itcz_eddies.mass import RAD_EARTH, mass_correction_from_columns
 from itcz_eddies.mse import C_P_SCRIPTS, budget_residual, moist_static_energy
 
 pytest.importorskip("windspharm")
@@ -191,3 +191,89 @@ def test_the_integrals_refuse_a_field_on_another_grid(synthetic):
     with pytest.raises(ValueError):
         column_integrals(synthetic["temp"], synthetic["sphum"], synthetic["geopot"],
                          synthetic["u"], synthetic["v"], shifted)
+def test_the_series_are_the_sums_they_are_documented_to_be(assembled):
+    """``net_mass_corr_zm`` and ``net_mass_daily`` are the sums ``SERIES``
+    says they are, exactly.  Both are what the mean-circulation term's net
+    mass transport is read from, and a refactor that swapped one for the
+    other would change that term with nothing else failing."""
+    _, _, fields, _ = assembled
+    np.testing.assert_array_equal(
+        fields["net_mass_corr_zm"].values,
+        (fields["v_dry_corr_zm"] + fields["v_vapor_corr_zm"]).values)
+    np.testing.assert_array_equal(
+        fields["net_mass_daily"].values,
+        (fields["req_dry_24h"] + fields["v_vapor_corr_zm"]).values)
+
+
+def test_the_mass_correction_is_separable_and_replaceable(synthetic, assembled):
+    """A different mass correction can be applied without re-reading ERA5.
+
+    This is what makes decision D2 cheap to revise; see ``RERUN-COSTS.md``.
+    Two halves.  The assembly stores the corrected wind ``v + dv`` and stores
+    ``dv`` beside it, so the uncorrected wind comes back by subtraction, to
+    float32 rounding.  And the correction is a function of the column
+    integrals and a tendency alone, all of which ``budget_YYYYMM.nc`` holds,
+    so a replacement can be formed without the three-dimensional fields.
+    """
+    integrals, kept, fields, keep = assembled
+
+    dv = fields["dv_mass"].isel(keep).astype("float32")
+    v_adj = (kept["v"] + dv).astype("float32")
+    recovered = (v_adj - dv).astype("float32")
+    # the wind is order 3 m/s, so float32 rounding of the sum is order 3e-7;
+    # 1e-5 m/s is 1e-3 cm/s, and the mean-circulation term moves 1.31 PW per
+    # cm/s, so this bounds the recovery error at about 1e-3 PW.
+    np.testing.assert_allclose(recovered.values,
+                               kept["v"].values.astype("float32"),
+                               rtol=0.0, atol=1e-5)
+
+    # a replacement built from the stored integrals and the other tendency
+    _, dv_new = mass_correction_from_columns(
+        integrals["u_dry"], integrals["v_dry"], integrals["mass_dry"],
+        synthetic["dry_mass_tend_24h"])
+    fresh = corrected_fields(integrals, synthetic["dry_mass_tend_24h"],
+                             synthetic["dry_mass_tend_24h"],
+                             synthetic["energy_tend_2h"], synthetic["f_net"])
+    np.testing.assert_array_equal(dv_new.values, fresh["dv_mass"].values)
+    # and it is a different correction, so the check above is not vacuous
+    assert float(abs(dv_new - fields["dv_mass"]).max()) > 0.0
+
+
+def test_the_mse_gauge_moves_only_the_net_mass_transport(synthetic, assembled):
+    """Adding a constant to the MSE shifts the corrected column MSE flux by
+    that constant times the corrected column mass transport, and moves
+    nothing else the assembly stores.
+
+    This is what makes decision D5 a post-hoc arithmetic change rather than a
+    rerun; see ``RERUN-COSTS.md`` and section D5 of the pipeline
+    recommendation.  The constant enters through the geopotential, since the
+    MSE is ``c_p T + gz + L q``.
+    """
+    integrals, _, fields, keep = assembled
+    c = 2.75e5  # J/kg, the size of c_p times 273.16 K
+
+    integrals_c, _ = column_integrals(
+        synthetic["temp"], synthetic["sphum"], synthetic["geopot"] + c,
+        synthetic["u"], synthetic["v"], synthetic["p_sfc"],
+        interfaces="logp", keep=keep)
+    fields_c = corrected_fields(integrals_c, synthetic["dry_mass_tend_2h"],
+                                synthetic["dry_mass_tend_24h"],
+                                synthetic["energy_tend_2h"], synthetic["f_net"])
+
+    # the correction and every mass series are gauge-free
+    np.testing.assert_allclose(fields_c["dv_mass"].values, fields["dv_mass"].values,
+                               rtol=1e-12, atol=0.0)
+    for name in SERIES:
+        np.testing.assert_allclose(fields_c[name].values, fields[name].values,
+                                   rtol=1e-12, atol=0.0,
+                                   err_msg=f"{name} moved under a change of gauge")
+
+    # and the MSE flux shifts by exactly c times the corrected mass transport
+    shift = (fields_c["vh_corr"] - fields["vh_corr"]).mean("longitude")
+    expected = c * fields["net_mass_corr_zm"]
+    # a tolerance relative to the scale of the shift, not to each value: the
+    # transport vanishes at both poles, where a relative tolerance compares
+    # two roundings of zero.
+    scale = float(abs(expected).max())
+    np.testing.assert_allclose(shift.values, expected.values,
+                               rtol=0.0, atol=1e-10 * scale)
