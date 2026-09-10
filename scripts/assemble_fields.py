@@ -150,7 +150,14 @@ def read_hourly(file_of, var, year, month, needed, spatial_resolution):
     latitude descending, loaded.
 
     Reads the month and both neighbors, since ``needed`` reaches twelve hours
-    past the month ends, and only the requested hours of each file.
+    past the month ends.  Each file is read as one contiguous block from the
+    first hour needed to the last, at full resolution, and strided in memory.
+    Measured on Casper on 2026-09-09 (the files are chunked 27 hours deep and
+    deflated): one full-resolution hour reads in 0.32 s, the same hour
+    strided through the netCDF library in 3.2 s, and six scattered strided
+    hours in 20 s, so the smoke run that read scattered strided hours took
+    80 s per field for 16 hours.  A month at full resolution is 3.1 GB, held
+    only until the stride is taken.
     """
     needed = np.asarray(needed, dtype="datetime64[ns]")
     pieces = []
@@ -161,11 +168,14 @@ def read_hourly(file_of, var, year, month, needed, spatial_resolution):
         with xr.open_dataset(path) as ds:
             step = stride(spatial_resolution,
                           float(ds["longitude"][1] - ds["longitude"][0]))
-            da = ds[var].isel(latitude=slice(None, None, step),
-                              longitude=slice(None, None, step))
-            hit = np.isin(da["time"].values.astype("datetime64[ns]"), needed)
-            if hit.any():
-                pieces.append(da.isel(time=np.flatnonzero(hit)).load())
+            hit = np.flatnonzero(np.isin(ds["time"].values.astype("datetime64[ns]"), needed))
+            if hit.size:
+                block = ds[var].isel(time=slice(int(hit[0]), int(hit[-1]) + 1)).load()
+                block = block.isel(latitude=slice(None, None, step),
+                                   longitude=slice(None, None, step))
+                keep = np.isin(block["time"].values.astype("datetime64[ns]"), needed)
+                pieces.append(block.isel(time=np.flatnonzero(keep)).copy())
+                del block
     out = xr.concat(pieces, "time").sortby("time")
     missing = np.setdiff1d(needed, out["time"].values.astype("datetime64[ns]"))
     if missing.size:
@@ -185,7 +195,7 @@ def on_grid(arr, lat, lon, name):
 
 
 def hours_of(times):
-    return sorted(set(((times - times.astype("datetime64[D]")) / HOUR).astype(int)))
+    return sorted({int(h) for h in ((times - times.astype("datetime64[D]")) / HOUR)})
 
 
 def common_attrs(args, times):

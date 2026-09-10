@@ -254,15 +254,26 @@ def read_meanflux_by_valid_time(
                 init.attrs.get("calendar", "standard"),
             ).astype("datetime64[ns]").reshape(init.size, fh.size)
             step = stride(spatial_resolution, float(ds[LON_STR][1] - ds[LON_STR][0]))
-            da = ds[var].isel({LAT_STR: slice(None, None, step),
-                               LON_STR: slice(None, None, step)})
             if lat is None:
-                lat, lon = da[LAT_STR].values, da[LON_STR].values
-            for i, j in zip(*np.nonzero(np.isin(valid, wanted))):
-                t = valid[i, j]
+                lat = ds[LAT_STR].values[::step]
+                lon = ds[LON_STR].values[::step]
+            hit = np.isin(valid, wanted)
+            if not hit.any():
+                continue
+            # One contiguous block of initializations, read at full resolution
+            # and strided in memory: the files are chunked one initialization
+            # deep and deflated, and a strided read through the netCDF library
+            # costs ten times a full one (measured 2026-09-09 on the hourly
+            # surface files, 3.2 s against 0.32 s a slab).
+            rows = np.flatnonzero(hit.any(axis=1))
+            block = ds[var].isel(forecast_initial_time=slice(int(rows[0]), int(rows[-1]) + 1)
+                                 ).transpose("forecast_initial_time", "forecast_hour",
+                                             LAT_STR, LON_STR).values[:, :, ::step, ::step]
+            for i, j in zip(*np.nonzero(hit[rows[0]:rows[-1] + 1])):
+                t = valid[rows[0] + i, j]
                 if t not in found:
-                    found[t] = da.isel(forecast_initial_time=i, forecast_hour=j
-                                       ).transpose(LAT_STR, LON_STR).values
+                    found[t] = np.array(block[i, j])
+            del block
     missing = [t for t in wanted if t not in found]
     if missing:
         raise ValueError(f"{var}: {len(missing)} of the {wanted.size} valid times wanted "
