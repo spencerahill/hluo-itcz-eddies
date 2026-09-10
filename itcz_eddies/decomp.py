@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import numpy as np
 import scipy.fft
+import scipy.signal
 import xarray as xr
 from puffins.constants import GRAV_EARTH
 
@@ -170,12 +171,46 @@ def lanczos_time_mean(arr, temporal_resolution=12, cutoff_days=30, lobes=60,
                       time_str=TIME_STR):
     """Lanczos low-pass in time, the recommendation in decision 2 of F11.
 
-    A convolution with the weights from ``lanczos_weights``, applied through
-    ``rolling(...).construct(...)`` so it works on any dimensionality.  The
-    ends of the record come back as NaN, over ``lobes`` steps at each end,
-    because a low-pass has no honest value there.  That is a real difference
-    from ``boxcar_time_mean``, which fills the ends with partial windows.
+    A convolution with the weights from ``lanczos_weights`` along the time
+    axis, done by FFT (``scipy.signal.fftconvolve``), which is exact for the
+    symmetric window up to rounding.  The ends of the record come back as
+    NaN, over ``lobes`` steps at each end, because a low-pass has no honest
+    value there.  That is a real difference from ``boxcar_time_mean``, which
+    fills the ends with partial windows.
+
+    Until 2026-09-09 this was ``rolling(...).construct("window").dot(weights)``,
+    a strided dot product whose cost grows with the window: on one latitude
+    of a band of the 1997 record at four samples a day (2188 by 37 by 720 in
+    float64, 481 weights) it took 16 s against 3.4 s here, on the laptop,
+    with the two agreeing to 2e-15.  A NaN in the input makes every output
+    whose window reaches it NaN, as the dot product did.
+    ``tests/test_decomp.py`` checks the two agree to rounding.
     """
+    weights = lanczos_weights(cutoff_days, temporal_resolution, lobes)
+    axis = arr.get_axis_num(time_str)
+    values = np.asarray(arr.values, dtype="float64")
+    n_times = values.shape[axis]
+    shape = [1] * values.ndim
+    shape[axis] = weights.size
+    finite = np.isfinite(values)
+    out = scipy.signal.fftconvolve(np.where(finite, values, 0.0), weights.reshape(shape),
+                                   mode="same", axes=axis)
+    if not finite.all():
+        reach = scipy.signal.fftconvolve((~finite).astype("float64"),
+                                         np.ones(shape), mode="same", axes=axis)
+        out[reach > 0.5] = np.nan
+    index = [slice(None)] * values.ndim
+    index[axis] = slice(0, lobes)
+    out[tuple(index)] = np.nan
+    index[axis] = slice(n_times - lobes, n_times)
+    out[tuple(index)] = np.nan
+    return arr.copy(data=out)
+
+
+def lanczos_time_mean_rolling(arr, temporal_resolution=12, cutoff_days=30, lobes=60,
+                              time_str=TIME_STR):
+    """The implementation ``lanczos_time_mean`` had until 2026-09-09, kept as
+    the reference its test compares the FFT convolution against."""
     weights = xr.DataArray(
         lanczos_weights(cutoff_days, temporal_resolution, lobes),
         dims=["window"],

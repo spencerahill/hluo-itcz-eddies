@@ -476,3 +476,39 @@ def test_zonal_mean_fields_are_the_weighted_means_of_the_time_means(
                 product.broadcast_like(with_fields["mmc"]).transpose(
                     *with_fields["mmc"].dims),
                 with_fields["mmc"], rtol=1e-14)
+
+
+# ------------------------------------------------ the Lanczos filter by FFT
+
+
+def test_the_fft_lanczos_matches_the_rolling_dot_product():
+    """The FFT convolution of 2026-09-09 gives what the strided dot product
+    gave, to rounding, with the same NaN ends, on a record with a trend,
+    an annual cycle, fast noise and more than one dimension."""
+    from itcz_eddies.decomp import lanczos_time_mean_rolling
+
+    rng = np.random.default_rng(7)
+    n_times = 500
+    time = np.arange(n_times, dtype="float64")
+    signal = (0.01 * time[:, None, None]
+              + np.sin(2 * np.pi * time[:, None, None] / 730.0)
+              + rng.standard_normal((n_times, 3, 4)))
+    arr = xr.DataArray(signal, dims=("time", "level", "latitude"),
+                       coords={"time": time, "level": [1.0, 2.0, 3.0],
+                               "latitude": [10.0, 5.0, 0.0, -5.0]})
+    for lobes in (20, 60):
+        fft = lanczos_time_mean(arr, lobes=lobes)
+        rolling = lanczos_time_mean_rolling(arr, lobes=lobes)
+        assert fft.dims == rolling.dims and fft.shape == rolling.shape
+        nan_fft = fft.isnull().all(("level", "latitude")).values
+        nan_rolling = rolling.isnull().all(("level", "latitude")).values
+        np.testing.assert_array_equal(nan_fft, nan_rolling)
+        assert nan_fft[:lobes].all() and nan_fft[-lobes:].all() and not nan_fft[lobes:-lobes].any()
+        interior = slice(lobes, n_times - lobes)
+        np.testing.assert_allclose(fft.values[interior], rolling.values[interior],
+                                   rtol=0, atol=1e-12)
+    # the time axis need not come first
+    transposed = arr.transpose("level", "time", "latitude")
+    fft_t = lanczos_time_mean(transposed, lobes=20)
+    np.testing.assert_allclose(fft_t.transpose("time", "level", "latitude").values[20:-20],
+                               lanczos_time_mean(arr, lobes=20).values[20:-20], rtol=0, atol=1e-12)
