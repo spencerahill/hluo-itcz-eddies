@@ -312,7 +312,7 @@ def corrected_month(args):
     # ---- the corrections, the residual and the series
     corr = corrected_fields(integrals, dry_mass_tend_2h, dry_mass_tend_24h,
                             energy_tend_2h, f_net)
-    summary = closure_summary(corr, p_sfc)
+    summary = closure_summary(corr, p_sfc, dry_mass_tend_2h)
     for key, value in summary.items():
         logging.info("%s: %.4g", key, value)
     logging.info("corrections formed at %.0f s", _time.monotonic() - started)

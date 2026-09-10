@@ -38,7 +38,7 @@ import xarray as xr
 from puffins.constants import GRAV_EARTH
 
 from .columns import col_int, dp_from_sfc_pressure
-from .mass import mass_correction_from_columns, polar_cap_transport
+from .mass import RAD_EARTH, mass_correction_from_columns, polar_cap_transport
 from .metrics import flux_to_petawatts
 from .mse import C_P_SCRIPTS, adjusted_col_fluxes, budget_residual, moist_static_energy
 from .names import LAT_STR, LEV_STR, LON_STR, TIME_STR
@@ -275,12 +275,13 @@ def corrected_fields(integrals, dry_mass_tend_2h, dry_mass_tend_24h, energy_tend
     return out
 
 
-def closure_summary(fields, p_sfc, band=(-30.0, 30.0), lat_str=LAT_STR,
-                    lon_str=LON_STR, time_str=TIME_STR):
+def closure_summary(fields, p_sfc, dry_mass_tend_2h, band=(-30.0, 30.0),
+                    lat_str=LAT_STR, lon_str=LON_STR, time_str=TIME_STR):
     """The numbers a run of the corrected assembly reports, as a dict.
 
-    ``fields`` is the Dataset ``corrected_fields`` returns and ``p_sfc`` the
-    surface pressure in hPa on (time, latitude, longitude).  Mass transports
+    ``fields`` is the Dataset ``corrected_fields`` returns, ``p_sfc`` the
+    surface pressure in hPa on (time, latitude, longitude) and
+    ``dry_mass_tend_2h`` the tendency the correction was formed with.  Mass transports
     are given as the equivalent barotropic wind in cm/s, the transport times
     gravity over the time-mean zonal-mean surface pressure, which is the unit
     of the pipeline recommendation: 1 cm/s of net zonal-mean mass transport
@@ -291,6 +292,15 @@ def closure_summary(fields, p_sfc, band=(-30.0, 30.0), lat_str=LAT_STR,
     the zonal mean of the flux correction the spherical-harmonic inversion
     produced; they must agree, and their largest difference is returned as
     a control.
+
+    The global mean of the dry-mass tendency is the part of the budget no
+    divergent correction can remove, and its polar-cap curve, that of a
+    uniform source, ``-Rbar a (1 - sin phi) / cos phi``, is what the
+    corrected transport misses the requirement by.  July 1997 at 00 and 12
+    UTC: ``Rbar`` is -1.8e-6 kg/m2/s, the gap 0.124 cm/s rms over the
+    tropics, and the gap minus that curve 0.0002 cm/s rms
+    (``code-review/checks/validate_assembly_july.py``, 2026-09-09), so the
+    closure is reported both ways.
     """
     lat = fields[lat_str]
     ps_zm = (p_sfc * 100.0).mean((time_str, lon_str))
@@ -307,10 +317,14 @@ def closure_summary(fields, p_sfc, band=(-30.0, 30.0), lat_str=LAT_STR,
     corrected = (fields["v_dry_corr_zm"] - fields["req_dry_2h"]).mean(time_str) * to_cms
     raw = (fields["v_dry_zm"] - fields["req_dry_2h"]).mean(time_str) * to_cms
     daily = (fields["net_mass_daily"] - fields["net_mass_corr_zm"]).mean(time_str) * to_cms
+    weights = np.cos(np.deg2rad(lat))
+    tend_zm = dry_mass_tend_2h.mean((time_str, lon_str))
+    tend_global_mean = float((tend_zm * weights).sum() / weights.sum())
+    phi = np.deg2rad(lat)
+    uniform = -tend_global_mean * RAD_EARTH * (1.0 - np.sin(phi)) / np.cos(phi) * to_cms
 
     r_bar = fields["energy_residual"].mean(time_str)
     r_zm = r_bar.mean(lon_str)
-    weights = np.cos(np.deg2rad(lat))
     global_mean = float((r_zm * weights).sum() / weights.sum())
     curve = flux_to_petawatts(polar_cap_transport(r_zm - global_mean, lat_str=lat_str),
                               lat_str=lat_str)
@@ -319,6 +333,8 @@ def closure_summary(fields, p_sfc, band=(-30.0, 30.0), lat_str=LAT_STR,
     return {
         "mass_closure_corrected_cms_rms_band": rms_band(corrected),
         "mass_nonclosure_raw_cms_rms_band": rms_band(raw),
+        "dry_mass_tend_global_mean_kg_m2_s": tend_global_mean,
+        "mass_closure_corrected_less_global_mean_cms_rms_band": rms_band(corrected - uniform),
         "dv_mass_rms_ms": rms(fields["dv_mass"]),
         "energy_residual_time_mean_map_rms_wm2": rms(r_bar),
         "energy_residual_global_mean_wm2": global_mean,

@@ -170,10 +170,15 @@ def test_the_kept_fields_are_the_wind_and_the_mse_on_the_sub_grid(synthetic, ass
 
 def test_the_summary_reports_the_closure(synthetic, assembled):
     _, _, fields, _ = assembled
-    summary = closure_summary(fields, synthetic["p_sfc"])
+    summary = closure_summary(fields, synthetic["p_sfc"], synthetic["dry_mass_tend_2h"])
     assert all(np.isfinite(value) for value in summary.values())
     assert (summary["mass_closure_corrected_cms_rms_band"]
             < 1e-2 * summary["mass_nonclosure_raw_cms_rms_band"])
+    # the prescribed tendency has no global mean, so the closure reported
+    # with the uniform-source curve removed is the closure itself
+    assert abs(summary["dry_mass_tend_global_mean_kg_m2_s"]) < 1e-12
+    np.testing.assert_allclose(summary["mass_closure_corrected_less_global_mean_cms_rms_band"],
+                               summary["mass_closure_corrected_cms_rms_band"], rtol=1e-6)
     # the cap integral of the zonal-mean residual and the zonal mean of the
     # inverted flux correction are two computations of one curve
     assert (summary["energy_flux_curve_vs_inversion_max_abs_pw"]
