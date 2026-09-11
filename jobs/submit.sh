@@ -33,8 +33,8 @@
 
 #PBS -N itcz-eddies
 #PBS -j oe
-#PBS -m ae
-#PBS -M shill1@ccny.cuny.edu
+#PBS -m n
+# no job mail: Spencer does not use the completion notices (2026-09-10)
 
 set -euo pipefail
 

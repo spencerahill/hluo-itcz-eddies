@@ -13,7 +13,7 @@
 #
 # Environment, with the defaults for Spencer's setup:
 #   REPO, CONDA_ENV, ACCOUNT, LOGS, WALLTIME (03:00:00), MEM (48GB)
-# The measured cost is written into the log by PBS; see the job's mail.
+# The measured cost is written into the log by PBS; read the log.
 
 set -euo pipefail
 
