@@ -128,7 +128,7 @@ def test_ddt_rejects_a_decoded_time_coordinate(myfun, arr4d):
     is a property of the xarray version rather than of this code: on xarray
     2026.7.0 the unit is seconds and the factor is 3600.  Asserting the exact
     value here is deliberate, so that an xarray release that changes the
-    default announces itself.
+    default fails this test.
     """
     hours = arr4d.time.values * 12.0
     decoded = arr4d.assign_coords(

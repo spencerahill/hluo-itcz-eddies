@@ -32,7 +32,7 @@ a decision recorded at the top of ``code-review/FINDINGS.md``.
    taken to each longitude's own surface pressure, which is where the published
    38% gap comes from.  See ``columns`` for that half.
 
-**The zonal mean has a weighting, and it decides whether five terms suffice.**
+**The zonal mean has a weighting, and it determines whether five terms suffice.**
 With an arithmetic zonal mean, the five-term split above closes exactly at each
 pressure level, and stops closing once the terms are column-integrated to each
 longitude's own surface pressure, because that integral weights longitudes

@@ -2,7 +2,7 @@
 
 Moved from ``myfun.py``, where ``ddt``, ``ddx``, ``ddy`` and ``ddp`` are
 byte-identical between the two copies.  Each original dispatches on the number
-of dimensions, ``len(da.shape(x))``, and the only thing the dispatch decides is
+of dimensions, ``len(da.shape(x))``, and the only thing the dispatch determines is
 the order of the ``transpose`` that follows.  Here the order is built from the
 dimensions actually present, in the canonical order ``(time, level, latitude,
 longitude)``, which reproduces every branch of every original.
@@ -91,7 +91,7 @@ def ddx(arr: xr.DataArray) -> xr.DataArray:
     The two divisions are kept separate, in the original's order, rather than
     folded into one division by their product.  Floating-point division is not
     associative, so ``(a / b) / c`` and ``a / (b * c)`` differ in the last bit,
-    and the equivalence test in ``tests/test_derivatives.py`` demands bitwise
+    and the equivalence test in ``tests/test_derivatives.py`` requires bitwise
     agreement.
     """
     deriv = _canonical(arr.differentiate(LON_STR))
