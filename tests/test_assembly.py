@@ -8,10 +8,13 @@ import xarray as xr
 
 from itcz_eddies.assembly import (
     COLUMN_INTEGRALS,
+    EP_ENTHALPY_T_REF,
     SERIES,
     closure_summary,
     column_integrals,
     corrected_fields,
+    d3_energy_curve,
+    energy_flux_curve,
 )
 from itcz_eddies.columns import col_int, dp_from_sfc_pressure
 from itcz_eddies.mass import RAD_EARTH, mass_correction_from_columns
@@ -221,7 +224,7 @@ def test_the_mass_correction_is_separable_and_replaceable(synthetic, assembled):
     v_adj = (kept["v"] + dv).astype("float32")
     recovered = (v_adj - dv).astype("float32")
     # the wind is order 3 m/s, so float32 rounding of the sum is order 3e-7;
-    # 1e-5 m/s is 1e-3 cm/s, and the mean-circulation term moves 1.31 PW per
+    # 1e-5 m/s is 1e-3 cm/s, and the mean-circulation term moves 1.4 PW per
     # cm/s, so this bounds the recovery error at about 1e-3 PW.
     np.testing.assert_allclose(recovered.values,
                                kept["v"].values.astype("float32"),
@@ -277,3 +280,118 @@ def test_the_mse_gauge_moves_only_the_net_mass_transport(synthetic, assembled):
     scale = float(abs(expected).max())
     np.testing.assert_allclose(shift.values, expected.values,
                                rtol=0.0, atol=1e-10 * scale)
+
+
+# ------------------------------------------------ decision D3's curve, 2026-09-24
+
+LAT_1D = np.linspace(90.0, -90.0, 181)
+
+
+def _on_lat(values):
+    return xr.DataArray(values, dims="latitude", coords={"latitude": LAT_1D})
+
+
+def _cap_curve_numpy(source):
+    """The flux in PW that closes a zonal-mean source in W/m2, rebuilt with
+    numpy alone: the area-weighted global mean removed, the trapezoid integral
+    over the cap north of each latitude, times 2 pi a^2."""
+    phi = np.deg2rad(LAT_1D)
+    w = np.cos(phi)
+    anomaly = source - (source * w).sum() / w.sum()
+    steps = 0.5 * (anomaly[1:] * w[1:] + anomaly[:-1] * w[:-1]) * np.abs(np.diff(phi))
+    return 2.0 * np.pi * RAD_EARTH ** 2 * np.concatenate([[0.0], np.cumsum(steps)]) * 1e-15
+
+
+def test_the_d3_curve_is_the_stored_curve_when_nothing_is_replaced():
+    """With the 24-hour storage equal to the two-hour one, no E - P and the
+    daily net mass transport equal to the sampled one, decision D3's curve is
+    the curve of the residual itself."""
+    phi = np.deg2rad(LAT_1D)
+    residual = _on_lat(30.0 * np.sin(phi) + 10.0 * np.cos(phi) ** 2)
+    tend = _on_lat(5.0 * np.sin(2 * phi))
+    net = _on_lat(1e3 * np.cos(phi))
+    curve = d3_energy_curve(residual, tend, tend, 0.0 * residual, net, net,
+                            _on_lat(3.4e5 + 0.0 * phi))
+    np.testing.assert_allclose(curve.values, energy_flux_curve(residual).values, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(energy_flux_curve(residual).values,
+                               _cap_curve_numpy(residual.values), rtol=1e-12, atol=1e-12)
+    assert np.array_equal(curve["latitude"].values, LAT_1D)
+
+
+def test_each_replacement_in_the_d3_curve_enters_with_its_sign():
+    """The three replacements, one at a time against a numpy reconstruction,
+    and each with the sign the physics sets at the equator:
+
+    * net evaporation in the north, E - P = B sin(phi) with B > 0, adds the
+      enthalpy of that water to the northern cap, so the northward flux the
+      budget requires across the equator falls;
+    * a 24-hour storage tendency above the two-hour one in the north raises
+      the northward flux the northern cap requires;
+    * a daily-mean net mass transport more northward than the sampled one
+      carries more MSE north, so the flux still required falls.
+    """
+    phi = np.deg2rad(LAT_1D)
+    eq = int(np.argmin(np.abs(LAT_1D)))
+    zero = _on_lat(0.0 * phi)
+    mse = 3.4e5
+    b = 2e-5
+    storage = 4.0 * np.sin(phi)
+    net_extra = 50.0 * np.cos(phi)
+    circumference = 2.0 * np.pi * RAD_EARTH * np.cos(phi)
+
+    ep_only = d3_energy_curve(zero, zero, zero, _on_lat(b * np.sin(phi)), zero, zero,
+                              _on_lat(mse + 0.0 * phi))
+    storage_only = d3_energy_curve(zero, zero, _on_lat(storage), zero, zero, zero,
+                                   _on_lat(mse + 0.0 * phi))
+    shift_only = d3_energy_curve(zero, zero, zero, zero, zero, _on_lat(net_extra),
+                                 _on_lat(mse + 0.0 * phi))
+
+    expected_ep = -_cap_curve_numpy(C_P_SCRIPTS * EP_ENTHALPY_T_REF * b * np.sin(phi))
+    expected_storage = _cap_curve_numpy(storage)
+    expected_shift = -net_extra * mse * circumference * 1e-15
+    for got, expected in ((ep_only, expected_ep), (storage_only, expected_storage),
+                          (shift_only, expected_shift)):
+        assert abs(expected[eq]) > 0.1
+        np.testing.assert_allclose(got.values, expected, rtol=1e-12, atol=1e-12)
+    assert ep_only.values[eq] < 0.0
+    assert storage_only.values[eq] > 0.0
+    assert shift_only.values[eq] < 0.0
+
+    together = d3_energy_curve(zero, zero, _on_lat(storage), _on_lat(b * np.sin(phi)), zero,
+                               _on_lat(net_extra), _on_lat(mse + 0.0 * phi))
+    np.testing.assert_allclose(together.values, expected_ep + expected_storage + expected_shift,
+                               rtol=1e-12, atol=1e-12)
+    # the reference temperature is a real parameter, not only its default
+    warmer = d3_energy_curve(zero, zero, zero, _on_lat(b * np.sin(phi)), zero, zero,
+                             _on_lat(mse + 0.0 * phi), t_ref=300.0)
+    np.testing.assert_allclose(warmer.values, expected_ep * 300.0 / EP_ENTHALPY_T_REF,
+                               rtol=1e-12, atol=1e-12)
+
+
+def test_the_summary_reports_the_d3_curve_only_when_given_its_inputs(synthetic, assembled):
+    integrals, _, fields, _ = assembled
+    base = closure_summary(fields, synthetic["p_sfc"], synthetic["dry_mass_tend_2h"])
+    assert "energy_flux_curve_d3_equator_pw" not in base
+
+    phi = np.deg2rad(synthetic["f_net"]["latitude"])
+    tend_24h = 0.5 * synthetic["energy_tend_2h"] + 3.0 * np.sin(phi)
+    e_minus_p = (2e-5 * np.sin(phi) + 0.0 * synthetic["f_net"]).transpose(
+        "time", "latitude", "longitude")
+    summary = closure_summary(fields, synthetic["p_sfc"], synthetic["dry_mass_tend_2h"],
+                              integrals=integrals, energy_tend_2h=synthetic["energy_tend_2h"],
+                              energy_tend_24h=tend_24h, e_minus_p=e_minus_p)
+    for key, value in base.items():
+        assert summary[key] == value
+
+    def tm_zm(arr):
+        return arr.mean(("time", "longitude"))
+
+    col_mse = tm_zm(integrals["s_h"]) / tm_zm(integrals["mass_dry"] + integrals["vapor"])
+    curve = d3_energy_curve(tm_zm(fields["energy_residual"]), tm_zm(synthetic["energy_tend_2h"]),
+                            tm_zm(tend_24h), tm_zm(e_minus_p),
+                            fields["net_mass_corr_zm"].mean("time"),
+                            fields["net_mass_daily"].mean("time"), col_mse)
+    eq = int(np.argmin(np.abs(curve["latitude"].values)))
+    np.testing.assert_allclose(summary["energy_flux_curve_d3_equator_pw"],
+                               float(curve.isel(latitude=eq)), rtol=1e-12)
+    assert abs(summary["energy_flux_curve_d3_equator_pw"] - base["energy_flux_curve_equator_pw"]) > 0.01

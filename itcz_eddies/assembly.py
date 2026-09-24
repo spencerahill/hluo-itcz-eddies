@@ -16,17 +16,22 @@ D2  the wind is corrected by the divergent barotropic wind that closes the
 D3  the residual of the column energy budget with the corrected wind and
     the hourly model-level storage tendency is stored beside the fields as
     the divergent flux correction that would close it, in W/m, and is never
-    turned into a wind;
+    turned into a wind.  The curve the paper states, as Spencer decided it
+    on 2026-09-24, is ``d3_energy_curve``: the budget with the 24-hour
+    storage tendency, the daily-mean net mass transport of D6, and the
+    enthalpy of the evaporation-minus-precipitation mass;
 D6  the daily-mean mass requirement, the polar-cap integral of the 24-hour
     centered tendency, is stored as a zonal-mean series so that the
     mean-circulation term's net mass transport can be taken from it.
 
-Three functions.  ``column_integrals`` loops over the analysis times and
+Five functions.  ``column_integrals`` loops over the analysis times and
 forms the column integrals in float64 one time at a time, since a month of
 five global three-dimensional fields does not fit in memory at once.
 ``corrected_fields`` takes those integrals and the tendencies and forms the
-corrections, the residual and the zonal-mean series.  ``closure_summary``
-reduces the result to the numbers a run reports.
+corrections, the residual and the zonal-mean series.  ``energy_flux_curve``
+turns a zonal-mean residual into the flux correction that closes it, and
+``d3_energy_curve`` computes decision D3's curve from time-mean zonal means.
+``closure_summary`` reduces the result to the numbers a run reports.
 """
 
 from __future__ import annotations
@@ -45,11 +50,20 @@ from .names import LAT_STR, LEV_STR, LON_STR, TIME_STR
 
 __all__ = [
     "COLUMN_INTEGRALS",
+    "EP_ENTHALPY_T_REF",
     "SERIES",
     "closure_summary",
     "column_integrals",
     "corrected_fields",
+    "d3_energy_curve",
+    "energy_flux_curve",
 ]
+
+# The temperature, in K, at which decision D3's curve takes the enthalpy of the
+# evaporation-minus-precipitation mass.  On ERA5 1997, 280 or 300 K moves the
+# curve at the equator by 0.04 PW or less (finding F38 in the project's
+# code-review/FINDINGS.md).
+EP_ENTHALPY_T_REF = 290.0
 
 COLUMN_INTEGRALS = {
     "u_dry": ("column dry-air mass flux, zonal, <(1 - q) u>", "kg m-1 s-1"),
@@ -275,8 +289,67 @@ def corrected_fields(integrals, dry_mass_tend_2h, dry_mass_tend_24h, energy_tend
     return out
 
 
+def energy_flux_curve(residual_zm, lat_str=LAT_STR):
+    """The northward flux correction, in PW, that closes a zonal-mean residual.
+
+    ``residual_zm`` is a zonal-mean column energy budget residual in W/m2 on
+    latitude, with any other dimensions carried along.  The curve is its
+    polar-cap integral with its area-weighted global mean removed, since no
+    divergent flux can carry the global mean, converted from W/m to PW
+    around the latitude circle.
+    """
+    weights = np.cos(np.deg2rad(residual_zm[lat_str]))
+    global_mean = (residual_zm * weights).sum(lat_str) / weights.sum(lat_str)
+    return flux_to_petawatts(polar_cap_transport(residual_zm - global_mean, lat_str=lat_str),
+                             lat_str=lat_str)
+
+
+def d3_energy_curve(residual_zm, energy_tend_2h_zm, energy_tend_24h_zm, e_minus_p_zm,
+                    net_mass_sampled_zm, net_mass_daily_zm, col_mean_mse_zm,
+                    t_ref=EP_ENTHALPY_T_REF, c_p=C_P_SCRIPTS, lat_str=LAT_STR):
+    r"""Decision D3's energy-residual curve as Spencer decided it on 2026-09-24, in PW.
+
+    Every input is a time mean of a zonal mean over the same analysis times,
+    on latitude.  ``residual_zm`` is the residual ``corrected_fields``
+    returns, ``dE/dt + div<vh_corr> - F_net`` in W/m2, with the two-hour
+    storage tendency ``energy_tend_2h_zm`` at the sampled hours.  The curve
+    is the flux correction of the budget the paper's total belongs to under
+    decision D6, which differs from that residual's in three ways:
+
+    * the storage is the 24-hour centered tendency ``energy_tend_24h_zm``,
+      since the two-hour one at fixed hours aliases the same sub-daily mass
+      cycle the two-hour mass requirement does (finding F39);
+    * the corrected wind's net mass transport ``net_mass_sampled_zm`` is
+      replaced by the daily-mean requirement ``net_mass_daily_zm``, carried
+      at the column-mean MSE ``col_mean_mse_zm`` in J/kg, as D6 replaces the
+      mean-circulation term's;
+    * the sources include ``c_p t_ref (E - P)``, the enthalpy of the
+      evaporation-minus-precipitation mass beyond its latent heat, with
+      ``e_minus_p_zm`` in kg/m2/s; the forecast model's net energy input
+      lacks it because its continuity equation has no such mass source
+      (finding F38).
+
+    With :math:`\mathcal{C}` the construction of ``energy_flux_curve``,
+
+    .. math::
+
+        C = \mathcal{C}\big(R + \Delta_E - c_p T_{ref}(E - P)\big)
+            - 2\pi a \cos\phi\,(M_{daily} - M_{sampled})\,\hat h \times 10^{-15}
+
+    where :math:`\Delta_E` is the 24-hour minus the two-hour storage
+    tendency, :math:`M` the net mass transports in kg/m/s and :math:`\hat h`
+    the column-mean MSE.
+    """
+    residual = (residual_zm + (energy_tend_24h_zm - energy_tend_2h_zm)
+                - c_p * t_ref * e_minus_p_zm)
+    shift = flux_to_petawatts((net_mass_daily_zm - net_mass_sampled_zm) * col_mean_mse_zm,
+                              lat_str=lat_str)
+    return energy_flux_curve(residual, lat_str=lat_str) - shift
+
+
 def closure_summary(fields, p_sfc, dry_mass_tend_2h, band=(-30.0, 30.0),
-                    lat_str=LAT_STR, lon_str=LON_STR, time_str=TIME_STR):
+                    integrals=None, energy_tend_2h=None, energy_tend_24h=None,
+                    e_minus_p=None, lat_str=LAT_STR, lon_str=LON_STR, time_str=TIME_STR):
     """The numbers a run of the corrected assembly reports, as a dict.
 
     ``fields`` is the Dataset ``corrected_fields`` returns, ``p_sfc`` the
@@ -285,13 +358,15 @@ def closure_summary(fields, p_sfc, dry_mass_tend_2h, band=(-30.0, 30.0),
     are given as the equivalent barotropic wind in cm/s, the transport times
     gravity over the time-mean zonal-mean surface pressure, which is the unit
     of the pipeline recommendation: 1 cm/s of net zonal-mean mass transport
-    is 1.3 PW of MSE flux at the equator.  Everything is a time mean over the
+    is 1.4 PW of MSE flux at the equator.  Everything is a time mean over the
     record passed in, and the rms values are over ``band``, 30S to 30N by
     default.  Two energy-residual curves are given, the polar-cap integral
     of the zonal-mean time-mean residual with its global mean removed, and
     the zonal mean of the flux correction the spherical-harmonic inversion
     produced; they must agree, and their largest difference is returned as
-    a control.
+    a control.  When ``integrals`` (from ``column_integrals``) and the
+    two-hour and 24-hour storage tendencies and E - P at the analysis times
+    are passed, decision D3's curve of ``d3_energy_curve`` is reported too.
 
     The global mean of the dry-mass tendency is the part of the budget no
     divergent correction can remove, and its polar-cap curve, that of a
@@ -326,11 +401,27 @@ def closure_summary(fields, p_sfc, dry_mass_tend_2h, band=(-30.0, 30.0),
     r_bar = fields["energy_residual"].mean(time_str)
     r_zm = r_bar.mean(lon_str)
     global_mean = float((r_zm * weights).sum() / weights.sum())
-    curve = flux_to_petawatts(polar_cap_transport(r_zm - global_mean, lat_str=lat_str),
-                              lat_str=lat_str)
+    curve = energy_flux_curve(r_zm, lat_str=lat_str)
     inversion = flux_to_petawatts(fields["v_flux_corr"].mean((time_str, lon_str)),
                                   lat_str=lat_str)
-    return {
+    d3 = {}
+    if all(x is not None for x in (integrals, energy_tend_2h, energy_tend_24h, e_minus_p)):
+        ref = fields["energy_residual"]
+
+        def tm_zm(arr, name):
+            return _on_grid_of(arr, ref, name, time_str, lat_str, lon_str).mean(
+                (time_str, lon_str))
+
+        col_mean_mse = (tm_zm(integrals["s_h"], "s_h")
+                        / tm_zm(integrals["mass_dry"] + integrals["vapor"], "column mass"))
+        d3_curve = d3_energy_curve(
+            r_zm, tm_zm(energy_tend_2h, "energy_tend_2h"),
+            tm_zm(energy_tend_24h, "energy_tend_24h"), tm_zm(e_minus_p, "e_minus_p"),
+            fields["net_mass_corr_zm"].mean(time_str), fields["net_mass_daily"].mean(time_str),
+            col_mean_mse, lat_str=lat_str)
+        d3 = {"energy_flux_curve_d3_rms_pw_band": rms_band(d3_curve),
+              "energy_flux_curve_d3_equator_pw": float(d3_curve.isel({lat_str: equator}))}
+    return d3 | {
         "mass_closure_corrected_cms_rms_band": rms_band(corrected),
         "mass_nonclosure_raw_cms_rms_band": rms_band(raw),
         "dry_mass_tend_global_mean_kg_m2_s": tend_global_mean,

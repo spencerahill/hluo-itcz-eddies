@@ -73,7 +73,8 @@ import xarray as xr
 from puffins.constants import GRAV_EARTH
 
 from itcz_eddies import paths
-from itcz_eddies.assembly import SERIES, closure_summary, column_integrals, corrected_fields
+from itcz_eddies.assembly import (EP_ENTHALPY_T_REF, SERIES, closure_summary, column_integrals,
+                                  corrected_fields)
 from itcz_eddies.era5 import read_data, read_meanflux_by_valid_time, stride
 from itcz_eddies.mass import centered_tendency
 from itcz_eddies.mse import (
@@ -287,6 +288,9 @@ def corrected_month(args):
     dry_mass_tend_2h = centered_tendency(dry_mass, times, half_window_hours=1)
     dry_mass_tend_24h = centered_tendency(dry_mass, times, half_window_hours=12)
     energy_tend_2h = centered_tendency(energy, times, half_window_hours=1)
+    # the daily-mean storage decision D3's curve takes, beside the daily-mean
+    # mass requirement of D6 (Spencer, 2026-09-24; finding F39)
+    energy_tend_24h = centered_tendency(energy, times, half_window_hours=12)
     p_sfc = sp.sel(time=times)
     del dry_mass, energy, tcwv, sp
     gc.collect()
@@ -310,6 +314,23 @@ def corrected_month(args):
         del rate
     f_net = net_energy_input(**rates)
     del rates
+    # evaporation minus precipitation at the same hours, for the enthalpy of
+    # that mass in decision D3's curve; ERA5's MER is negative for evaporation
+    ep_rates = {}
+    for var in ("MER", "MTPR"):
+        files = paths.meanflux_files(var, year, month, pad_december=False)
+        for path in files:
+            if not path.exists():
+                raise SystemExit(f"missing {path}")
+        rate = on_grid(read_meanflux_by_valid_time(files, var, args.spatial_resolution,
+                                                   bracket, lat_descending=True),
+                       lat, lon, var)
+        ep_rates[var] = 0.5 * (rate.sel(time=times).values + rate.sel(time=times + HOUR).values)
+        del rate
+    e_minus_p = xr.DataArray(-ep_rates["MER"] - ep_rates["MTPR"],
+                             dims=("time", "latitude", "longitude"),
+                             coords={"time": times, "latitude": lat, "longitude": lon})
+    del ep_rates
     gc.collect()
     logging.info("net energy input formed at %.0f s", _time.monotonic() - started)
 
@@ -332,7 +353,9 @@ def corrected_month(args):
     # ---- the corrections, the residual and the series
     corr = corrected_fields(integrals, dry_mass_tend_2h, dry_mass_tend_24h,
                             energy_tend_2h, f_net)
-    summary = closure_summary(corr, p_sfc, dry_mass_tend_2h)
+    summary = closure_summary(corr, p_sfc, dry_mass_tend_2h, integrals=integrals,
+                              energy_tend_2h=energy_tend_2h, energy_tend_24h=energy_tend_24h,
+                              e_minus_p=e_minus_p)
     for key, value in summary.items():
         logging.info("%s: %.4g", key, value)
     logging.info("corrections formed at %.0f s", _time.monotonic() - started)
@@ -368,6 +391,15 @@ def corrected_month(args):
     budget["energy_tendency"].attrs.update(
         long_name="rate of change of the column energy from the hourly model-level "
                   "integrals vipile plus vike, two-hour centered", units="W m-2")
+    budget["energy_tendency_24h"] = energy_tend_24h.astype("float32")
+    budget["energy_tendency_24h"].attrs.update(
+        long_name="rate of change of the column energy from the hourly model-level "
+                  "integrals vipile plus vike, 24-hour centered, the storage of "
+                  "decision D3's curve", units="W m-2")
+    budget["e_minus_p"] = e_minus_p.astype("float32")
+    budget["e_minus_p"].attrs.update(
+        long_name="evaporation minus precipitation from the forecast rates bracketing "
+                  "the analysis time", units="kg m-2 s-1")
     budget["f_net"] = f_net.astype("float32")
     budget["f_net"].attrs.update(long_name="net energy input to the column from the "
                                  "forecast rates bracketing the analysis time", units="W m-2")
@@ -380,6 +412,7 @@ def corrected_month(args):
     budget["p_sfc"] = p_sfc.astype("float32")
     budget["p_sfc"].attrs.update(long_name="surface pressure", units="hPa")
     budget.attrs.update(attrs)
+    budget.attrs["ep_enthalpy_t_ref"] = EP_ENTHALPY_T_REF
     write(budget, out_dir / f"budget_{year}{month:02d}.nc")
     logging.info("done at %.0f s", _time.monotonic() - started)
 

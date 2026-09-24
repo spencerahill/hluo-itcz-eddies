@@ -5,9 +5,10 @@ analysis produces the wind and the surface pressure separately, and the
 interpolation to pressure levels adds its own error (Trenberth 1991,
 *J. Climate* 4, 707).  For an energy transport this matters at first order,
 because the column-integrated MSE flux is nearly the column mass transport
-times a column-mean MSE near 3.2e5 J/kg: a spurious net zonal-mean mass
-transport equivalent to a barotropic wind of 1 cm/s carries 1.3 PW across
-the equator (F17).  Measured on ERA5 for July 1997, the raw wind's
+times a column-mean MSE near 3.45e5 J/kg in the deep tropics: a spurious
+net zonal-mean mass transport equivalent to a barotropic wind of 1 cm/s is
+1.4 PW of MSE flux across the equator (F17, with the column-mean MSE of
+ERA5 July 1997 from F37).  Measured on ERA5 for July 1997, the raw wind's
 zonal-mean column mass transport is 1 to 2 cm/s in the deep tropics (F19).
 
 The standard remedy is to correct the divergent part of the wind
