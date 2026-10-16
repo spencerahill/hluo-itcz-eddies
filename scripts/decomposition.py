@@ -88,8 +88,16 @@ into ``zonal_mean_fields_YYYY.nc`` as ``net_mass_daily_bar`` and
 mean-circulation term with its net mass transport taken from the daily-mean
 requirement (decision D6).
 
+``--mass-correction-profile GAMMA`` (added 2026-10-16) is a sensitivity test
+of decision D2.  The fields files store the barotropic correction ``dv_mass``
+beside the corrected wind, and each band's wind is rebuilt with that
+correction given the profile ``(p/p_s)^GAMMA`` at the same column mass flux
+(``mass.profile_mass_correction``), before the split.  The output directory
+name ends in ``_dvprofGAMMA``, so the run never overwrites the pipeline's.
+
 Usage:
   python scripts/decomposition.py --year 1997
+  python scripts/decomposition.py --year 1997 --mass-correction-profile 2
   python scripts/decomposition.py --year 1997 --quadrature trapezoid --split wind \
       --time-mean boxcar --barotropic-correction
 """
@@ -123,6 +131,7 @@ from itcz_eddies.decomp import (
     legacy_decompose,
 )
 from itcz_eddies.era5 import read_data
+from itcz_eddies.mass import profile_mass_correction
 from itcz_eddies.mse import adjust_wind_by_mse_flux, moist_static_energy
 
 TIME_MEANS = {
@@ -196,6 +205,13 @@ def parse_args(argv=None):
                              "fields; auto names the corrected assembly at this "
                              "sampling and these interfaces, and an empty string "
                              "names the root")
+    parser.add_argument("--mass-correction-profile", type=float, default=None,
+                        metavar="GAMMA",
+                        help="give the assembly's barotropic mass correction dv_mass "
+                             "the vertical profile (p/p_s)^GAMMA, keeping its column "
+                             "mass flux (mass.profile_mass_correction); a sensitivity "
+                             "test of decision D2, which needs fields files that include "
+                             "dv_mass")
     return parser.parse_args(argv)
 
 
@@ -210,8 +226,11 @@ def config_tag(args):
         time_mean = f"lanczos{args.lanczos_cutoff_days:g}d{args.lanczos_lobes}"
     elif time_mean == "ideal":
         time_mean = f"ideal{args.lanczos_cutoff_days:g}d"
-    return (f"{args.quadrature}_{time_mean}_{barotropic}_{weighting}"
-            f"_{args.temporal_resolution:g}h_{args.interfaces}")
+    tag = (f"{args.quadrature}_{time_mean}_{barotropic}_{weighting}"
+           f"_{args.temporal_resolution:g}h_{args.interfaces}")
+    if args.mass_correction_profile is not None:
+        tag += f"_dvprof{args.mass_correction_profile:g}"
+    return tag
 
 
 def fields_tag(args):
@@ -323,7 +342,9 @@ def fields_files(args):
 def read_year_from_fields(args, files):
     """v, MSE and surface pressure from the assembled monthly files, lazily,
     with the assembly's zonal-mean net mass transport series loaded, or
-    ``None`` for files of the archived mode, which carry none."""
+    ``None`` for files of the archived mode, which carry none, and the
+    barotropic correction ``dv_mass`` lazily when
+    ``--mass-correction-profile`` is given, else ``None``."""
     logging.info("reading %d assembled fields files from %s", len(files),
                  files[0].parent)
     ds = xr.open_mfdataset(files, concat_dim="time", combine="nested",
@@ -338,7 +359,14 @@ def read_year_from_fields(args, files):
         logging.warning("the fields files carry no net mass transport series "
                         "(archived mode), so the zonal-mean fields will not "
                         "carry the daily-mean net mass transport of decision D6")
-    return ds["v_adj"], ds["mse"], ds["p_sfc"], series
+    dv = None
+    if args.mass_correction_profile is not None:
+        if "dv_mass" not in ds:
+            raise SystemExit("--mass-correction-profile needs the barotropic "
+                             "correction dv_mass, which these fields files do not "
+                             "include (archived mode)")
+        dv = ds["dv_mass"]
+    return ds["v_adj"], ds["mse"], ds["p_sfc"], series, dv
 
 
 def read_year(args):
@@ -351,21 +379,27 @@ def read_year(args):
                 "applies the archived adjustment, which exists at 00 and 12 UTC "
                 "only, so run scripts/assemble_fields.py first"
             )
+        if args.mass_correction_profile is not None:
+            raise SystemExit("--mass-correction-profile needs the corrected "
+                             "assembly's fields files, which include dv_mass")
         logging.info("no assembled fields for %d under %s; reading ERA5 directly",
                      args.year, paths.fields_root())
-        return read_year_from_era5(args) + (None,), "era5"
+        return read_year_from_era5(args) + (None, None), "era5"
     return read_year_from_fields(args, files), "fields"
 
 
 # ------------------------------------------------------- the exact split
 
 
-def exact_split_by_band(v, mse, p_sfc, args):
+def exact_split_by_band(v, mse, p_sfc, args, dv=None):
     """Run ``decompose`` band by band in latitude, in float64, in memory.
 
     Returns the column-integrated maps of the six pointwise terms and the
     total, and the zonal-mean fields the mean-circulation term is built
-    from, both concatenated over latitude.
+    from, both concatenated over latitude.  With ``dv``, the barotropic
+    correction already added to the wind, that correction is first given
+    the profile of ``--mass-correction-profile`` on each band's layer
+    thicknesses.
     """
     n_lat = v.sizes["latitude"]
     band = args.lat_band
@@ -380,6 +414,10 @@ def exact_split_by_band(v, mse, p_sfc, args):
         pb = p_sfc.isel(latitude=sl).astype("float64").load()
         dp = dp_from_sfc_pressure(vb["level"], pb, interfaces=args.interfaces
                                   ).transpose(*vb.dims)
+        if dv is not None:
+            dvb = dv.isel(latitude=sl).astype("float64").load()
+            vb = profile_mass_correction(vb, dvb, dp, pb, args.mass_correction_profile)
+            del dvb
         if args.split == "mass-flux":
             # The split of the layer mass flux: the column integral is the
             # sum over levels, since dp/g is inside every term, and five
@@ -516,7 +554,13 @@ def main(argv=None):
             "which splits the wind and the MSE; pass --split wind"
         )
 
-    (v, mse, p_sfc, series), source = read_year(args)
+    if args.barotropic_correction and args.mass_correction_profile is not None:
+        raise SystemExit(
+            "--barotropic-correction reproduces the published calculation, which "
+            "has no dry-air mass correction to give a profile to"
+        )
+
+    (v, mse, p_sfc, series, dv), source = read_year(args)
     zonal_mean_fields = None
     worst_gap = None
     if args.barotropic_correction:
@@ -525,7 +569,7 @@ def main(argv=None):
         logging.info("streaming the fields one latitude band at a time: %s",
                      dict(v.sizes))
         reduced, zonal_mean_fields, worst_gap = exact_split_by_band(
-            v, mse, p_sfc, args)
+            v, mse, p_sfc, args, dv=dv)
         if series is not None:
             zonal_mean_fields = attach_series_time_means(
                 zonal_mean_fields, series, args)
@@ -563,6 +607,8 @@ def main(argv=None):
     }
     if worst_gap is not None:
         run_config["six_term_gap_relative_to_band_peak"] = worst_gap
+    if args.mass_correction_profile is not None:
+        run_config["mass_correction_profile_gamma"] = args.mass_correction_profile
 
     for name in reduced.data_vars:
         out = out_dir / f"vMSE_col_{name}_{args.year}.nc"

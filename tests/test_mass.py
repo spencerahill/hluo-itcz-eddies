@@ -7,7 +7,12 @@ import pytest
 import xarray as xr
 
 from itcz_eddies.columns import col_int, dp_from_sfc_pressure
-from itcz_eddies.mass import centered_tendency, dry_air_mass_correction, polar_cap_transport
+from itcz_eddies.mass import (
+    centered_tendency,
+    dry_air_mass_correction,
+    polar_cap_transport,
+    profile_mass_correction,
+)
 
 pytest.importorskip("windspharm")
 
@@ -118,3 +123,71 @@ def test_a_24_hour_centered_tendency_is_blind_to_the_diurnal_and_semidiurnal_cyc
     np.testing.assert_allclose(daily.values, 2.0 / 3600.0, rtol=1e-12)
     hourly = centered_tendency(x, times, half_window_hours=1)
     assert float(abs(hourly - 2.0 / 3600.0).max()) > 1.0 / 3600.0
+
+
+@pytest.fixture
+def profile_fields():
+    """Columns whose surface pressures put the 1000 hPa level above ground in
+    some and below it in others, a wind and an MSE that vary with height, and
+    a barotropic correction of either sign."""
+    lev = xr.DataArray(LEVELS, dims="level", coords={"level": LEVELS})
+    p_sfc = xr.DataArray(np.array([[960.0, 1012.0, 875.0], [990.0, 1005.0, 1020.0]]),
+                         dims=("time", "latitude"))
+    order = ("time", "level", "latitude")
+    dp = dp_from_sfc_pressure(lev, p_sfc, interfaces="logp").transpose(*order)
+    v = (2.0 * np.sin(np.pi * lev / 1000.0) + 0.0 * p_sfc).transpose(*order)
+    h = (3.0e5 + 3.0e4 * ((lev - 600.0) / 400.0) ** 2 + 0.0 * p_sfc).transpose(*order)
+    dv = xr.DataArray(np.array([[0.02, -0.03, 0.04], [0.01, 0.05, -0.02]]),
+                      dims=("time", "latitude"))
+    return v, h, dv, dp, p_sfc
+
+
+def test_a_flat_profile_is_the_barotropic_correction(profile_fields):
+    v, h, dv, dp, p_sfc = profile_fields
+    assert np.array_equal(profile_mass_correction(v, dv, dp, p_sfc, 0.0).values, v.values)
+
+
+@pytest.mark.parametrize("gamma", [1.0, 2.0, 4.0])
+def test_a_profile_keeps_the_column_mass_flux(profile_fields, gamma):
+    v, h, dv, dp, p_sfc = profile_fields
+    out = profile_mass_correction(v, dv, dp, p_sfc, gamma)
+    change = out - v
+    # the profile moves the correction between levels, by a fair fraction of dv
+    assert float(abs(change).max()) > 0.2 * float(abs(dv).max())
+    # and leaves its column integral alone, to rounding
+    scale = float(abs(dv * dp.sum("level")).max())
+    assert float(abs((change * dp).sum("level")).max()) < 1e-12 * scale
+
+
+@pytest.mark.parametrize("gamma", [1.0, 2.0, 4.0])
+def test_a_profile_is_bottom_heavy(profile_fields, gamma):
+    """(p/p_s)^gamma is largest at the surface, so the correction exceeds the
+    barotropic one in the lowest layer above ground and falls short of it at
+    100 hPa, in every column."""
+    v, h, dv, dp, p_sfc = profile_fields
+    corr = (profile_mass_correction(v, dv, dp, p_sfc, gamma) - v + dv) / dv
+    corr = corr.transpose("time", "latitude", "level").values
+    above = dp.transpose("time", "latitude", "level").values > 0
+    k_lowest = above.shape[-1] - 1 - np.argmax(above[..., ::-1], axis=-1)
+    lowest = np.take_along_axis(corr, k_lowest[..., None], axis=-1)[..., 0]
+    assert sorted(set(LEVELS[k_lowest].ravel())) == [850.0, 925.0, 1000.0]
+    assert np.all(lowest > 1.0)
+    assert np.all(corr[..., 0] < 1.0)
+
+
+@pytest.mark.parametrize("gamma", [1.0, 2.0, 4.0])
+def test_the_mse_flux_changes_by_the_profile_weighted_mse(profile_fields, gamma):
+    """The column MSE flux changes by dv * sum(dp) * (<h>_f - <h>), with the
+    two column means rebuilt here in numpy."""
+    v, h, dv, dp, p_sfc = profile_fields
+    out = profile_mass_correction(v, dv, dp, p_sfc, gamma)
+    got = ((out - v) * h * dp).sum("level").transpose("time", "latitude").values
+
+    dpv = dp.transpose("time", "latitude", "level").values
+    hv = h.transpose("time", "latitude", "level").values
+    f = (LEVELS[None, None, :] / p_sfc.values[:, :, None]) ** gamma
+    h_mass = (hv * dpv).sum(-1) / dpv.sum(-1)
+    h_prof = (hv * f * dpv).sum(-1) / (f * dpv).sum(-1)
+    expected = dv.values * dpv.sum(-1) * (h_prof - h_mass)
+    assert np.all(np.abs(expected) > 0.0)
+    np.testing.assert_allclose(got, expected, rtol=1e-9)

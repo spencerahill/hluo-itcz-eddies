@@ -60,6 +60,7 @@ __all__ = [
     "dry_air_mass_correction",
     "mass_correction_from_columns",
     "polar_cap_transport",
+    "profile_mass_correction",
 ]
 
 RAD_EARTH = 6.371e6
@@ -140,6 +141,43 @@ def mass_correction_from_columns(u_col, v_col, mass, tendency, lat_str=LAT_STR,
                                        lat_str=lat_str, lon_str=lon_str,
                                        time_str=time_str)
     return (u_adj - u_col) / mass, (v_adj - v_col) / mass
+
+
+def profile_mass_correction(v, dv, dp, p_sfc, gamma, lev_str=LEV_STR):
+    r"""The corrected wind with its barotropic correction given a vertical profile.
+
+    ``v`` is the wind with the barotropic correction ``dv`` already added, as
+    the assembly stores it in ``v_adj``.  The correction is replaced by
+
+    .. math::
+
+        \delta v(p) = dv\,\frac{\sum_k \delta p_k}{\sum_k f(p_k)\,\delta p_k}\,f(p),
+        \qquad f(p) = (p / p_s)^\gamma,
+
+    on the layer thicknesses ``dp`` of the column quadrature, so its column
+    mass flux is that of ``dv`` and the column mass budget the correction
+    closes stays closed.  ``gamma = 0`` is the barotropic correction and
+    returns ``v`` unchanged.  Bangalath and Pauluis (2020, *Geophys. Res.
+    Lett.* 47, e2020GL089764) use profiles of this form with ``gamma`` near
+    1, 2 and 4 for the time-mean, zonal-mean wind.
+
+    The column MSE flux changes by ``dv`` times the column mass times the
+    difference between the ``f``-weighted and the mass-weighted column-mean
+    MSE, so the profile matters only through how the MSE varies with height.
+
+    What is held fixed is the column flux of dry air and vapor together.
+    Decision D2 closes the dry-air budget, so under a profile weighted
+    toward the moist lower layers the dry-air part of the column correction
+    is smaller in magnitude and the vapor part larger, by the same amount;
+    undoing that needs the humidity, which the assembled fields files do not
+    include.
+
+    ``dv`` is on (time, latitude, longitude); ``dp`` is on the dimensions of
+    ``v``; ``p_sfc`` is in the units of the level coordinate.
+    """
+    f = (v[lev_str] / p_sfc) ** gamma
+    weight = dp.sum(lev_str) / (f * dp).sum(lev_str)
+    return (v + dv * (f * weight - 1.0)).transpose(*v.dims)
 
 
 def polar_cap_transport(zonal_mean_source, lat_str=LAT_STR, radius=RAD_EARTH):
